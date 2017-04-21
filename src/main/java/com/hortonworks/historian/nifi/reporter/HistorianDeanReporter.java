@@ -70,6 +70,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -102,6 +103,14 @@ public class HistorianDeanReporter extends AbstractReportingTask {
             .defaultValue("jdbc:hive://localhost:10500/default")
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
+    static final PropertyDescriptor DRUID_BROKER_HTTP_ENDPOINT = new PropertyDescriptor.Builder()
+    		.name("Druid Broker HTTP endpoint")
+    		.description("Druid Broker HTTP endpoint")
+            .required(true)
+            .expressionLanguageSupported(true)
+            .defaultValue("localhost:8082")
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
     static final PropertyDescriptor DRUID_METASTORE_CONNECTION_STRING = new PropertyDescriptor.Builder()
     		.name("Druid Meta Store Connection String")
     		.description("The connection string for the Druid Metastore that contains information about Druid's storage segments.")
@@ -120,6 +129,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     private String DEFAULT_ADMIN_PASS = "admin";
     private String atlasUrl;
     private String nifiUrl;
+    private String druidBrokerUrl;
     private String hiveServerUri;
     private String druidMetaUri;
     private String[] basicAuth = {DEFAULT_ADMIN_USER, DEFAULT_ADMIN_PASS};
@@ -146,6 +156,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         properties.add(ATLAS_URL);
         properties.add(NIFI_URL);
         properties.add(HIVE_SERVER_CONNECTION_STRING);
+        properties.add(DRUID_BROKER_HTTP_ENDPOINT);
         properties.add(DRUID_METASTORE_CONNECTION_STRING);
         return properties;
     }
@@ -167,6 +178,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         //int pageSize = reportingContext.getProperty(ACTION_PAGE_SIZE).asInteger();
         atlasUrl = reportingContext.getProperty(ATLAS_URL).getValue();
         nifiUrl = reportingContext.getProperty(NIFI_URL).getValue();
+        druidBrokerUrl = reportingContext.getProperty(DRUID_BROKER_HTTP_ENDPOINT).getValue();
         hiveServerUri = reportingContext.getProperty(HIVE_SERVER_CONNECTION_STRING).getValue();
         druidMetaUri = reportingContext.getProperty(DRUID_METASTORE_CONNECTION_STRING).getValue();
         String[] atlasURL = {atlasUrl};
@@ -226,22 +238,34 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 	    String username = "";
 	    String password = "";
 	    String hiveTableName = "";
+	    String druidDataSourceUrl = druidBrokerUrl + "/druid/v2/datasources";
+	    getLogger().info("********************* Getting List of Druid Datasources from API: " + druidDataSourceUrl);
 	    try {
+	    	List<String> result = null;
+	    	JSONObject druidDataSourceJSON = readJSONFromUrlAuth(druidBrokerUrl, basicAuth);
+	    	getLogger().info("************************ Response from Druid: " + druidDataSourceJSON);
+        	//nifiComponentJSON = json.getJSONObject("component").getJSONObject("config").getJSONObject("properties");
+        	result = new ObjectMapper().readValue(druidDataSourceJSON.toString(), List.class);
+        	
+        	Iterator<String> resultIterator = result.iterator();
+	    	/*
 	    	username = "druid";
 		    password = "admin";
 	    	Class.forName("com.mysql.jdbc.Driver");
 	    	Connection mySQLConnection = DriverManager.getConnection(druidMetaUri, username, password);
 		    Statement stmt = mySQLConnection.createStatement();
 		    ResultSet druidDataSources = stmt.executeQuery("SELECT DISTINCT datasource FROM druid_segments");
+		    getLogger().info("********************* : " + hiveTableName);*/
 		    
 		    username = "hive";
 		    password = "hive";
+		    Class.forName("org.apache.hadoop.hive.jdbc.HiveDriver");
 		    Connection hiveConnection = DriverManager.getConnection(hiveServerUri, username, password);
-		    while(druidDataSources.next()){
-		    	stmt = hiveConnection.createStatement();
-		    	hiveTableName = druidDataSources.getString("datasource");
+		    Statement stmt = null;
+		    while(resultIterator.hasNext()){
+		    	hiveTableName = resultIterator.next();
 		    	getLogger().info("********************* Attempting to create Hive Table from Druid Data Source: " + hiveTableName);
-		    	stmt.execute("CREATE EXTERNAL TABLE IF NOT EXISTS " + hiveTableName + " "
+		    	hiveConnection.createStatement().execute("CREATE EXTERNAL TABLE IF NOT EXISTS " + hiveTableName + " "
 		    				+ "STORED BY 'org.apache.hadoop.hive.druid.DruidStorageHandler' "
 		    				+ "TBLPROPERTIES (\"druid.datasource\" = \"" + hiveTableName + "\")");
 		    }
@@ -249,7 +273,9 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 			e.printStackTrace();
 		} catch (ClassNotFoundException e) {
 			e.printStackTrace();
-		}
+		} catch (Exception e) {
+            e.printStackTrace();
+        }
     }
     
 	public void registerHistorianMetaData(){
