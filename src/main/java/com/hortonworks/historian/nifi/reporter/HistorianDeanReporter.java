@@ -100,7 +100,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
             .description("The connection string for Hive Server that contains the database where Druid backed tables are managed.")
             .required(true)
             .expressionLanguageSupported(true)
-            .defaultValue("jdbc:hive://localhost:10500/default")
+            .defaultValue("jdbc:hive2://localhost:10500/default")
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
     static final PropertyDescriptor DRUID_BROKER_HTTP_ENDPOINT = new PropertyDescriptor.Builder()
@@ -150,6 +150,8 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 	private List<Referenceable> inputs;
 	private List<Referenceable> outputs;
 	
+	Connection hiveConnection;
+	
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
         final List<PropertyDescriptor> properties = new ArrayList<>();
@@ -157,7 +159,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         properties.add(NIFI_URL);
         properties.add(HIVE_SERVER_CONNECTION_STRING);
         properties.add(DRUID_BROKER_HTTP_ENDPOINT);
-        properties.add(DRUID_METASTORE_CONNECTION_STRING);
+        //properties.add(DRUID_METASTORE_CONNECTION_STRING);
         return properties;
     }
     
@@ -168,10 +170,11 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     @Override
     public void onTrigger(ReportingContext reportingContext) {
     	// create the Atlas client if we don't have one
+    	/*
     	Properties props = System.getProperties();
         props.setProperty("atlas.conf", "/usr/hdp/current/atlas-client/conf");
         getLogger().info("***************** atlas.conf has been set to: " + props.getProperty("atlas.conf"));
-    	
+    	*/
         inputs = new ArrayList<Referenceable>();
     	outputs = new ArrayList<Referenceable>();
         //EventAccess eventAccess = reportingContext.getEventAccess();
@@ -180,7 +183,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         nifiUrl = reportingContext.getProperty(NIFI_URL).getValue();
         druidBrokerUrl = reportingContext.getProperty(DRUID_BROKER_HTTP_ENDPOINT).getValue();
         hiveServerUri = reportingContext.getProperty(HIVE_SERVER_CONNECTION_STRING).getValue();
-        druidMetaUri = reportingContext.getProperty(DRUID_METASTORE_CONNECTION_STRING).getValue();
+        //druidMetaUri = reportingContext.getProperty(DRUID_METASTORE_CONNECTION_STRING).getValue();
         String[] atlasURL = {atlasUrl};
 		
     	if (atlasClient == null) {
@@ -195,8 +198,15 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     	
     	getLogger().info("********************* Number of Reports Sent: " + timesTriggered);
         if(timesTriggered == 0){
-        	getLogger().info("********************* Checking if data model has been created...");
+        	String hiveUsername = "hive";
+		    String hivePassword = "hive";
+		    
         	try {
+        		getLogger().info("********************* Establishing Connection to Hive Server...");
+        		Class.forName("org.apache.hive.jdbc.HiveDriver");
+        		hiveConnection = DriverManager.getConnection(hiveServerUri, hiveUsername, hivePassword);
+				
+				getLogger().info("********************* Checking if data model has been created...");
         		String historianDataModelJSON = generateHistorianDataModel();
         		getLogger().info("***************** Historian Data Model as JSON = " + historianDataModelJSON);
         		atlasClient.createType(historianDataModelJSON);
@@ -205,6 +215,10 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 			} catch (AtlasServiceException e) {
 				e.printStackTrace();
 			} catch (AtlasException e) {
+				e.printStackTrace();
+			} catch (ClassNotFoundException e) {
+				e.printStackTrace();
+			} catch (SQLException e) {
 				e.printStackTrace();
 			}
         }
@@ -235,19 +249,10 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     }
     
     public void exposeDruidDataSourceAsHiveTable(){
-	    String username = "";
-	    String password = "";
 	    String hiveTableName = "";
-	    String druidDataSourceUrl = druidBrokerUrl + "/druid/v2/datasources";
-	    getLogger().info("********************* Getting List of Druid Datasources from API: " + druidDataSourceUrl);
+	    String druidDatasourceUrl = druidBrokerUrl + "/druid/v2/datasources";
+	    getLogger().info("********************* Getting List of Druid Datasources from API: " + druidDatasourceUrl);
 	    try {
-	    	List<String> result = null;
-	    	JSONArray druidDataSourceJSON = readJSONArrayFromUrlAuth(druidBrokerUrl, basicAuth);
-	    	getLogger().info("************************ Response from Druid: " + druidDataSourceJSON);
-        	//nifiComponentJSON = json.getJSONObject("component").getJSONObject("config").getJSONObject("properties");
-        	result = new ObjectMapper().readValue(druidDataSourceJSON.toString(), List.class);
-        	
-        	Iterator<String> resultIterator = result.iterator();
 	    	/*
 	    	username = "druid";
 		    password = "admin";
@@ -257,10 +262,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		    ResultSet druidDataSources = stmt.executeQuery("SELECT DISTINCT datasource FROM druid_segments");
 		    getLogger().info("********************* : " + hiveTableName);*/
 		    
-		    username = "hive";
-		    password = "hive";
-		    Class.forName("org.apache.hadoop.hive.jdbc.HiveDriver");
-		    Connection hiveConnection = DriverManager.getConnection(hiveServerUri, username, password);
+        	Iterator<String> resultIterator = getDruidDatasourceList(druidDatasourceUrl).iterator();
 		    while(resultIterator.hasNext()){
 		    	hiveTableName = resultIterator.next();
 		    	getLogger().info("********************* Attempting to create Hive Table from Druid Data Source: " + hiveTableName);
@@ -270,11 +272,25 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		    }
 	    }catch (SQLException e) {
 			e.printStackTrace();
-		} catch (ClassNotFoundException e) {
-			e.printStackTrace();
 		} catch (Exception e) {
             e.printStackTrace();
         }
+    }
+    
+    public List<String> getDruidDatasourceList(String druidDataSourceUrl){
+    	List<String> result = null;
+    	JSONArray druidDataSourceJSON;
+		try {
+			druidDataSourceJSON = readJSONArrayFromUrlAuth(druidDataSourceUrl, basicAuth);
+			getLogger().info("************************ Response from Druid: " + druidDataSourceJSON);
+	    	result = new ObjectMapper().readValue(druidDataSourceJSON.toString(), List.class);
+		} catch (IOException e) {
+			e.printStackTrace();
+		} catch (JSONException e) {
+			e.printStackTrace();
+		}
+    	
+    	return result;
     }
     
 	public void registerHistorianMetaData(){
