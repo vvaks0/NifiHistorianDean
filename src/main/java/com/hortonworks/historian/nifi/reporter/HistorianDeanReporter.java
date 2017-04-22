@@ -261,7 +261,6 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		    password = "hive";
 		    Class.forName("org.apache.hadoop.hive.jdbc.HiveDriver");
 		    Connection hiveConnection = DriverManager.getConnection(hiveServerUri, username, password);
-		    Statement stmt = null;
 		    while(resultIterator.hasNext()){
 		    	hiveTableName = resultIterator.next();
 		    	getLogger().info("********************* Attempting to create Hive Table from Druid Data Source: " + hiveTableName);
