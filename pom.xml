@@ -77,5 +77,13 @@
                 <version>2.15</version>
             </plugin>
         </plugins>
+        <resources>
+      		<resource>
+        		<directory>src/main/resources</directory>
+        			<includes>
+          				<include>atlas-application.properties</include>
+        			</includes>
+      		</resource>
+      	</resources>	
     </build>
 </project>
