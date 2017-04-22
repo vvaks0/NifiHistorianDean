@@ -44,7 +44,7 @@ import org.apache.nifi.controller.ConfigurationContext;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.reporting.AbstractReportingTask;
 import org.apache.nifi.reporting.ReportingContext;
-
+import org.codehaus.jettison.json.JSONArray;
 import org.codehaus.jettison.json.JSONException;
 import org.codehaus.jettison.json.JSONObject;
 
@@ -108,7 +108,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     		.description("Druid Broker HTTP endpoint")
             .required(true)
             .expressionLanguageSupported(true)
-            .defaultValue("localhost:8082")
+            .defaultValue("http://localhost:8082")
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
     static final PropertyDescriptor DRUID_METASTORE_CONNECTION_STRING = new PropertyDescriptor.Builder()
@@ -242,7 +242,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 	    getLogger().info("********************* Getting List of Druid Datasources from API: " + druidDataSourceUrl);
 	    try {
 	    	List<String> result = null;
-	    	JSONObject druidDataSourceJSON = readJSONFromUrlAuth(druidBrokerUrl, basicAuth);
+	    	JSONArray druidDataSourceJSON = readJSONArrayFromUrlAuth(druidBrokerUrl, basicAuth);
 	    	getLogger().info("************************ Response from Druid: " + druidDataSourceJSON);
         	//nifiComponentJSON = json.getJSONObject("component").getJSONObject("config").getJSONObject("properties");
         	result = new ObjectMapper().readValue(druidDataSourceJSON.toString(), List.class);
@@ -707,6 +707,28 @@ public class HistorianDeanReporter extends AbstractReportingTask {
             e.printStackTrace();
         }
         return json;
+    }
+	
+	private JSONArray readJSONArrayFromUrlAuth(String urlString, String[] basicAuth) throws IOException, JSONException {
+		String userPassString = basicAuth[0]+":"+basicAuth[1];
+		JSONObject json = null;
+		JSONArray jsonArray = null;
+		try {
+            URL url = new URL (urlString);
+            //Base64.encodeBase64String(userPassString.getBytes());
+
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("GET");
+            connection.setDoOutput(true);
+            connection.setRequestProperty  ("Authorization", "Basic " + encoding);
+            InputStream content = (InputStream)connection.getInputStream();
+            BufferedReader rd = new BufferedReader(new InputStreamReader(content, Charset.forName("UTF-8")));
+  	      	String jsonText = readAll(rd);
+  	      	jsonArray = new JSONArray(jsonText);
+        } catch(Exception e) {
+            e.printStackTrace();
+        }
+        return jsonArray;
     }
 	
 	private String readAll(Reader rd) throws IOException {
