@@ -280,13 +280,13 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				sqlString = " SELECT `"+currColumnName+"`, COUNT(`"+currColumnName+"`)"
 									+ " FROM "+currTableName+" "
 									+ " GROUP BY `"+currColumnName+"`";
-				getLogger().info("********************* Establishing Connection to Hive Server...");
-				getLogger().info("********************* Executing Query: " + sqlString);
+				
+				getLogger().info("********************* Executing Hive Query: " + sqlString);
 				ResultSet result = hiveConnection.createStatement().executeQuery(sqlString);
 				while(result.next()){
 					Referenceable currTagReferenceable = new Referenceable(HistorianDataTypes.HISTORIAN_TAG.getName());
-					currTagReferenceable.set("name",result.getString("function"));
-					currTagReferenceable.set("qualifiedName",currTableName+"."+result.getString("function"));
+					currTagReferenceable.set("name",result.getString(currColumnName));
+					currTagReferenceable.set("qualifiedName",currTableName+"."+currColumnName+"."+result.getString("function"));
 					getLogger().info("********************* New Tag Entity: " + InstanceSerialization.toJson(currTagReferenceable,true));
 					tagReferenceableList.add(currTagReferenceable);	
 				}
