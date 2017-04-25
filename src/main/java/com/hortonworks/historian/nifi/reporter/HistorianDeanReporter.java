@@ -34,7 +34,8 @@ import org.apache.atlas.typesystem.types.Multiplicity;
 import org.apache.atlas.typesystem.types.StructTypeDefinition;
 import org.apache.atlas.typesystem.types.TraitType;
 import org.apache.atlas.typesystem.types.utils.TypesUtil;
-
+import org.apache.htrace.fasterxml.jackson.core.JsonParseException;
+import org.apache.htrace.fasterxml.jackson.databind.JsonMappingException;
 import org.apache.htrace.fasterxml.jackson.databind.ObjectMapper;
 
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
@@ -210,7 +211,9 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         		String historianDataModelJSON = generateHistorianDataModel();
         		getLogger().info("***************** Historian Data Model as JSON = " + historianDataModelJSON);
         		atlasClient.createType(historianDataModelJSON);
-				getLogger().info("********************* Created: " + atlasClient.createType(historianDataModelJSON));
+				getLogger().info("********************* Created Types: " + atlasClient.createType(historianDataModelJSON));
+				
+				getLogger().info("********************* Created Traits: " + atlasClient.createTraitType("tag_dimension"));
 				
 			} catch (AtlasServiceException e) {
 				e.printStackTrace();
@@ -222,19 +225,33 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				e.printStackTrace();
 			}
         }
+        timesTriggered++;
         
         getLogger().info("********************* Looking for new Druid Datasources to expose as Hive Tables...");
         exposeDruidDataSourceAsHiveTable();
-        getLogger().info("********************* Done...");
         
+        getLogger().info("********************* Cross Reference Atlas to Discover new Tags...");
+        
+		try {
+			String dslQuery = "hive_column is tag_dimension";
+			JSONArray results = atlasClient.searchByDSL(dslQuery);
+			getLogger().debug("***************** result: " + results);
+	        List<Referenceable> tagList = discoverNewTags(results);
+	        atlasClient.createEntity(tagList);
+		} catch (AtlasServiceException e) {
+			e.printStackTrace();
+		}
+		
+		getLogger().info("********************* Done...");
+		
+		/*
        	Map<PropertyDescriptor,String> properties = reportingContext.getProperties();
-       	getLogger().info("*********************LISTING ALL PROPERTIES");
+       	getLogger().debug("*********************LISTING ALL PROPERTIES");
        	for (Map.Entry<PropertyDescriptor, String> property: properties.entrySet()){
-       		getLogger().info("********************* KEY: " + property.getKey());
-       		getLogger().info("********************* VALUE: " + property.getValue());
+       		getLogger().debug("********************* KEY: " + property.getKey());
+       		getLogger().debug("********************* VALUE: " + property.getValue());
        	}
        	
-       	/*
        	List<Action> actions = reportingContext.getEventAccess().getFlowChanges(1, 10);
        	for (Action action: actions){
        		getLogger().info("********************* ID: " + action.getId());
@@ -245,8 +262,48 @@ public class HistorianDeanReporter extends AbstractReportingTask {
        		getLogger().info("********************* TYPE: " + action.getSourceType());
        		getLogger().info("********************* OPERATIONS: " + action.getOperation());       		
        	}*/
-       	
     }
+    
+    public List<Referenceable> discoverNewTags(JSONArray results){
+		String sqlString = null;
+		List<HashMap> referenceablesJSON = null;
+		List<Referenceable> tagReferenceableList = new ArrayList<Referenceable>();
+		try {
+			referenceablesJSON = new ObjectMapper().readValue(results.toString(), List.class);
+			Iterator<HashMap> refIterator = referenceablesJSON.iterator();
+			while(refIterator.hasNext()){
+				HashMap currReferenceable = refIterator.next();
+				String currColumnName = currReferenceable.get("name").toString();
+				String tableId = ((HashMap)currReferenceable.get("table")).get("id").toString(); 
+				Referenceable currTable = atlasClient.getEntity(tableId);
+				String currTableName = currTable.get("name").toString();
+				sqlString = " SELECT `"+currColumnName+"`, COUNT(`"+currColumnName+"`)"
+									+ " FROM "+currTableName+" "
+									+ " GROUP BY `"+currColumnName+"`";
+				getLogger().info("********************* Establishing Connection to Hive Server...");
+				getLogger().info("********************* Executing Query: " + sqlString);
+				ResultSet result = hiveConnection.createStatement().executeQuery(sqlString);
+				while(result.next()){
+					Referenceable currTagReferenceable = new Referenceable(HistorianDataTypes.HISTORIAN_TAG.getName());
+					currTagReferenceable.set("name",result.getString("function"));
+					currTagReferenceable.set("qualifiedName",currTableName+"."+result.getString("function"));
+					getLogger().info("********************* New Tag Entity: " + InstanceSerialization.toJson(currTagReferenceable,true));
+					tagReferenceableList.add(currTagReferenceable);	
+				}
+			}
+		} catch (JsonParseException e) {
+			e.printStackTrace();
+		} catch (JsonMappingException e) {
+			e.printStackTrace();
+		} catch (IOException e) {
+			e.printStackTrace();
+		} catch (AtlasServiceException e) {
+			e.printStackTrace();
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}
+		return tagReferenceableList;
+	}
     
     public void exposeDruidDataSourceAsHiveTable(){
 	    String hiveTableName = "";
