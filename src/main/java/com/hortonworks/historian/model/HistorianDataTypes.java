@@ -24,18 +24,16 @@ package com.hortonworks.historian.model;
 public enum HistorianDataTypes {
 
     // Classes
-    NIFI_FLOW_CONTROLLER,
-    NIFI_PROCESS_GROUP,
-    NIFI_PROCESSOR,
-    NIFI_CONNECTION,
-    HTTP_SERVICE,
+    
     DRUID_PLATFORM,
     DRUID_DATASOURCE,
     HISTORIAN_ASSET,
     HISTORIAN_TAG,
-    HISTORIAN_TAG_ATTRIBUTE
+    HISTORIAN_TAG_ATTRIBUTE,
+    //Traits
+  	TAG_DIMENSION
     ;
-
+	
     public String getName() {
         return name().toLowerCase();
     }

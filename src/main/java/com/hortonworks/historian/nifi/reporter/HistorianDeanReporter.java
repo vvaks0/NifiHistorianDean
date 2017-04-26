@@ -208,12 +208,18 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         		hiveConnection = DriverManager.getConnection(hiveServerUri, hiveUsername, hivePassword);
 				
 				getLogger().info("********************* Checking if data model has been created...");
-        		String historianDataModelJSON = generateHistorianDataModel();
+				try {
+					atlasClient.getType(HistorianDataTypes.TAG_DIMENSION.getName());
+					getLogger().info("********************* Trait: " + HistorianDataTypes.TAG_DIMENSION.getName() + " is already present");
+				} catch (AtlasServiceException e) {
+					getLogger().info("***************** Creating " + HistorianDataTypes.TAG_DIMENSION.getName() + " Trait...");
+					atlasClient.createTraitType(HistorianDataTypes.TAG_DIMENSION.getName());
+				}
+				String historianDataModelJSON = generateHistorianDataModel();
         		getLogger().info("***************** Historian Data Model as JSON = " + historianDataModelJSON);
         		atlasClient.createType(historianDataModelJSON);
 				getLogger().info("********************* Created Types: " + atlasClient.createType(historianDataModelJSON));
 				
-				getLogger().info("********************* Created Traits: " + atlasClient.createTraitType("tag_dimension"));
 				
 			} catch (AtlasServiceException e) {
 				e.printStackTrace();
@@ -708,7 +714,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 
         classTypeDefinitions.put(typeName, definition);
     }
-
+    
     public TypesDef getTypesDef() {
         return TypesUtil.getTypesDef(getEnumTypeDefinitions(), getStructTypeDefinitions(), getTraitTypeDefinitions(), getClassTypeDefinitions());
     }
