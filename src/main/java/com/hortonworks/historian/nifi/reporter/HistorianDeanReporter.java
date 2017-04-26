@@ -279,7 +279,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 			Iterator<HashMap> refIterator = referenceablesJSON.iterator();
 			while(refIterator.hasNext()){
 				HashMap currReferenceable = refIterator.next();
-				String currColumnId = currReferenceable.get("id").toString();
+				//String currColumnId = currReferenceable.get("$id").toString();
 				String currColumnName = currReferenceable.get("name").toString();
 				String tableId = ((HashMap)currReferenceable.get("table")).get("id").toString(); 
 				Referenceable currTable = atlasClient.getEntity(tableId);
