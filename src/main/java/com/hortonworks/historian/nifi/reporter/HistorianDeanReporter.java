@@ -273,6 +273,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 			Iterator<HashMap> refIterator = referenceablesJSON.iterator();
 			while(refIterator.hasNext()){
 				HashMap currReferenceable = refIterator.next();
+				String currColumnId = currReferenceable.get("id").toString();
 				String currColumnName = currReferenceable.get("name").toString();
 				String tableId = ((HashMap)currReferenceable.get("table")).get("id").toString(); 
 				Referenceable currTable = atlasClient.getEntity(tableId);
@@ -286,7 +287,9 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				while(result.next()){
 					Referenceable currTagReferenceable = new Referenceable(HistorianDataTypes.HISTORIAN_TAG.getName());
 					currTagReferenceable.set("name",result.getString(currColumnName));
-					currTagReferenceable.set("qualifiedName",currTableName+"."+currColumnName+"."+result.getString("function"));
+					currTagReferenceable.set("qualifiedName",currTableName+"."+currColumnName+"."+result.getString(currColumnName));
+					currTagReferenceable.set("parent_column", null);
+					currTagReferenceable.set("granularity", null);
 					getLogger().info("********************* New Tag Entity: " + InstanceSerialization.toJson(currTagReferenceable,true));
 					tagReferenceableList.add(currTagReferenceable);	
 				}
@@ -676,6 +679,8 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 
         final AttributeDefinition[] attributeDefinitions = new AttributeDefinition[] {
         		new AttributeDefinition(NAME, DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
+        		new AttributeDefinition("granularity", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
+        		new AttributeDefinition("parent_column", "hive_column", Multiplicity.OPTIONAL, false, null),
         		new AttributeDefinition("parent_asset", HistorianDataTypes.HISTORIAN_ASSET.getName(), Multiplicity.OPTIONAL, false, null),
                 new AttributeDefinition("tags_attributes", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_TAG_ATTRIBUTE.getName()), Multiplicity.OPTIONAL, true, null)
         };
