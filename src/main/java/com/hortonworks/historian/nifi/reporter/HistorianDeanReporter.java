@@ -373,7 +373,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     	String druidSegmentUrl = druidBrokerUrl + "/druid/v2";
     	DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
 		String currentDate = dateFormat.format(new Date()).toString();
-		String dateBefore = dateFormat.format(new Date(new Date().getTime() - (1 * 24 * 3600 * 1000L))).toString();
+		String dateBefore = dateFormat.format(new Date(new Date().getTime() - (30 * 24 * 3600 * 1000L))).toString();
 		
 		String payload = "{\"queryType\":\"segmentMetadata\","
 						+ "\"dataSource\":\""+dataSource+"\","
