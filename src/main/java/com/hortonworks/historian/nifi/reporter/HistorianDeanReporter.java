@@ -60,6 +60,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.Reader;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -69,7 +70,10 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -139,12 +143,11 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     private Map<String,Object> entityMap = new HashMap<String,Object>();
     
     private String NAME = "name";
-    private String FLOW = "flow";
-    private String PROCESS_GROUP = "processGroup";
     private String SOURCE = "source";
     private String DESTINATION = "destination";
     private String PROPERTIES = "parameters";
     
+    private Map<String,Map<String, Object>> dataSourceDetails = new HashMap<String,Map<String,Object>>();
     private Map<String, EnumTypeDefinition> enumTypeDefinitionMap = new HashMap<String, EnumTypeDefinition>();
 	private Map<String, StructTypeDefinition> structTypeDefinitionMap = new HashMap<String, StructTypeDefinition>();
 	private Map<String, HierarchicalTypeDefinition<ClassType>> classTypeDefinitions = new HashMap<String, HierarchicalTypeDefinition<ClassType>>();
@@ -220,7 +223,6 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         		atlasClient.createType(historianDataModelJSON);
 				getLogger().info("********************* Created Types: " + atlasClient.createType(historianDataModelJSON));
 				
-				
 			} catch (AtlasServiceException e) {
 				e.printStackTrace();
 			} catch (AtlasException e) {
@@ -279,8 +281,13 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 			Iterator<HashMap> refIterator = referenceablesJSON.iterator();
 			while(refIterator.hasNext()){
 				HashMap currReferenceable = refIterator.next();
-				//String currColumnId = currReferenceable.get("$id").toString();
+				String currColumnId = ((HashMap)currReferenceable.get("$id$")).get("id").toString();
+				String currColumnVersion = ((HashMap)currReferenceable.get("$id$")).get("version").toString();
+				String currColumnType = ((HashMap)currReferenceable.get("$id$")).get("$typeName$").toString();
+				String currColumnState = ((HashMap)currReferenceable.get("$id$")).get("state").toString();
 				String currColumnName = currReferenceable.get("name").toString();
+				Id currColumnRefId = new Id(currColumnId,Integer.valueOf(currColumnVersion),currColumnType,currColumnState);
+				
 				String tableId = ((HashMap)currReferenceable.get("table")).get("id").toString(); 
 				Referenceable currTable = atlasClient.getEntity(tableId);
 				String currTableName = currTable.get("name").toString();
@@ -291,11 +298,12 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				getLogger().info("********************* Executing Hive Query: " + sqlString);
 				ResultSet result = hiveConnection.createStatement().executeQuery(sqlString);
 				while(result.next()){
+					String currGranularity = deserializeDataSourceGranularity(currTableName);
 					Referenceable currTagReferenceable = new Referenceable(HistorianDataTypes.HISTORIAN_TAG.getName());
-					currTagReferenceable.set("name",result.getString(currColumnName));
+					currTagReferenceable.set("name",result.getString(currColumnName)+"_"+currGranularity);
 					currTagReferenceable.set("qualifiedName",currTableName+"."+currColumnName+"."+result.getString(currColumnName));
-					currTagReferenceable.set("parent_column", null);
-					currTagReferenceable.set("granularity", null);
+					currTagReferenceable.set("parent_column", currColumnRefId);
+					currTagReferenceable.set("granularity", currGranularity);
 					getLogger().info("********************* New Tag Entity: " + InstanceSerialization.toJson(currTagReferenceable,true));
 					tagReferenceableList.add(currTagReferenceable);	
 				}
@@ -314,25 +322,43 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		return tagReferenceableList;
 	}
     
+    public String deserializeDataSourceGranularity(String dataSource){
+    	Map<String,Object> granularityMap = dataSourceDetails.get(dataSource);
+    	String granularityType = ((HashMap)granularityMap.get("queryGranularity")).get("type").toString();
+		String granularity = "";
+		if(granularityType.equalsIgnoreCase("none")){
+			granularity = "NONE";
+		}else if(granularityType.equalsIgnoreCase("all")){
+				granularity = "ALL";	
+		}else{
+			String granularityDuration = ((HashMap)granularityMap.get("queryGranularity")).get("duration").toString();
+			switch(granularityDuration){
+				case "1000":  
+					granularity = "SECOND";
+					break;
+				case "60000":
+					granularity = "MINUTE";
+					break;
+				case "3600000":
+					granularity = "HOUR";
+					break;
+				case "86400000":
+					granularity = "DAY";
+					break;
+			}
+		}
+    	return granularity;
+    }
+    
     public void exposeDruidDataSourceAsHiveTable(){
 	    String hiveTableName = "";
-	    String druidDatasourceUrl = druidBrokerUrl + "/druid/v2/datasources";
-	    getLogger().info("********************* Getting List of Druid Datasources from API: " + druidDatasourceUrl);
 	    try {
-	    	/*
-	    	username = "druid";
-		    password = "admin";
-	    	Class.forName("com.mysql.jdbc.Driver");
-	    	Connection mySQLConnection = DriverManager.getConnection(druidMetaUri, username, password);
-		    Statement stmt = mySQLConnection.createStatement();
-		    ResultSet druidDataSources = stmt.executeQuery("SELECT DISTINCT datasource FROM druid_segments");
-		    getLogger().info("********************* : " + hiveTableName);*/
-		    
-        	Iterator<String> resultIterator = getDruidDatasourceList(druidDatasourceUrl).iterator();
-		    while(resultIterator.hasNext()){
-		    	hiveTableName = resultIterator.next();
-		    	getLogger().info("********************* Attempting to create Hive Table from Druid Data Source: " + hiveTableName);
-		    	hiveConnection.createStatement().execute("CREATE EXTERNAL TABLE IF NOT EXISTS " + hiveTableName + " "
+	    	Iterator<String> resultIterator = getDruidDataSourceList().iterator();	
+			while(resultIterator.hasNext()){
+				hiveTableName = resultIterator.next();
+				dataSourceDetails = getDruidDataSourceDetails(hiveTableName);
+				getLogger().info("********************* Attempting to create Hive Table from Druid Data Source: " + hiveTableName);
+				hiveConnection.createStatement().execute("CREATE EXTERNAL TABLE IF NOT EXISTS " + hiveTableName + " "
 		    				+ "STORED BY 'org.apache.hadoop.hive.druid.DruidStorageHandler' "
 		    				+ "TBLPROPERTIES (\"druid.datasource\" = \"" + hiveTableName + "\")");
 		    }
@@ -343,10 +369,42 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         }
     }
     
-    public List<String> getDruidDatasourceList(String druidDataSourceUrl){
-    	List<String> result = null;
+    private Map<String,Map<String, Object>> getDruidDataSourceDetails(String dataSource) {
+    	String druidSegmentUrl = druidBrokerUrl + "/druid/v2";
+    	DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
+		String currentDate = dateFormat.format(new Date()).toString();
+		String dateBefore = dateFormat.format(new Date(new Date().getTime() - (1 * 24 * 3600 * 1000L))).toString();
+		
+		String payload = "{\"queryType\":\"segmentMetadata\","
+						+ "\"dataSource\":\""+dataSource+"\","
+						+ "\"intervals\":[\""+dateBefore+"/"+currentDate+"\"],"
+						+ "\"analysisTypes\":[\"queryGranularity\",\"aggregators\",\"rollup\"]"
+						+ "}";
+		List<Map<String,Object>> result = null;
+		JSONArray druidSegmentsJSON;
+		try {
+			System.out.println("************************ Url: " + druidSegmentUrl);
+			System.out.println("************************ Sending: " + payload);
+			druidSegmentsJSON = readJSONArrayFromUrlAuthPOST(druidSegmentUrl, basicAuth, payload);
+			System.out.println("************************ Response from Druid: " + druidSegmentsJSON);
+	    	result = new ObjectMapper().readValue(druidSegmentsJSON.toString(), List.class);
+		} catch (IOException e) {
+			e.printStackTrace();
+		} catch (JSONException e) {
+			e.printStackTrace();
+		}
+    	Map<String,Map<String,Object>> dataSourceDetailsMap = new HashMap<String,Map<String,Object>>();
+    	dataSourceDetailsMap.put(dataSource, result.get(0));
+    	
+    	return dataSourceDetailsMap; 
+	}
+
+	public List<String> getDruidDataSourceList(){
+		String druidDataSourceUrl = druidBrokerUrl + "/druid/v2/datasources";
+		List<String> result = null;
     	JSONArray druidDataSourceJSON;
 		try {
+			getLogger().info("********************* Getting List of Druid Datasources from API: " + druidDataSourceUrl);
 			druidDataSourceJSON = readJSONArrayFromUrlAuth(druidDataSourceUrl, basicAuth);
 			getLogger().info("************************ Response from Druid: " + druidDataSourceJSON);
 	    	result = new ObjectMapper().readValue(druidDataSourceJSON.toString(), List.class);
@@ -359,6 +417,38 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     	return result;
     }
     
+	private JSONArray readJSONArrayFromUrlAuthPOST(String urlString, String[] basicAuth, String payload) throws IOException, JSONException {
+		String userPassString = basicAuth[0]+":"+basicAuth[1];
+		JSONObject json = null;
+		JSONArray jsonArray = null;
+		try {
+            URL url = new URL (urlString);
+            //Base64.encodeBase64String(userPassString.getBytes());
+            
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("POST");
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Authorization", "Basic " + encoding);
+            connection.setRequestProperty("Content-Type", "application/json");
+            
+            OutputStream os = connection.getOutputStream();
+    		os.write(payload.getBytes());
+    		os.flush();
+            
+            if (connection.getResponseCode() != 200) {
+    			throw new RuntimeException("Failed : HTTP error code : " + connection.getResponseCode() + " : " + connection.getResponseMessage());
+    		}
+            
+            InputStream content = (InputStream)connection.getInputStream();
+            BufferedReader rd = new BufferedReader(new InputStreamReader(content, Charset.forName("UTF-8")));
+  	      	String jsonText = readAll(rd);
+  	      	jsonArray = new JSONArray(jsonText);
+        } catch(Exception e) {
+            e.printStackTrace();
+        }
+        return jsonArray;
+    }
+	
 	public void registerHistorianMetaData(){
 		System.out.println("***************** Creating Meta Data Entities...");
 		
