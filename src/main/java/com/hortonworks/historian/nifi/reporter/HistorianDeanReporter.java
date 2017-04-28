@@ -252,24 +252,6 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		
 		getLogger().info("********************* Done...");
 		
-		/*
-       	Map<PropertyDescriptor,String> properties = reportingContext.getProperties();
-       	getLogger().debug("*********************LISTING ALL PROPERTIES");
-       	for (Map.Entry<PropertyDescriptor, String> property: properties.entrySet()){
-       		getLogger().debug("********************* KEY: " + property.getKey());
-       		getLogger().debug("********************* VALUE: " + property.getValue());
-       	}
-       	
-       	List<Action> actions = reportingContext.getEventAccess().getFlowChanges(1, 10);
-       	for (Action action: actions){
-       		getLogger().info("********************* ID: " + action.getId());
-       		getLogger().info("********************* SOURCEID: " + action.getSourceId());
-       		getLogger().info("********************* NAME: " + action.getSourceName());
-       		getLogger().info("********************* ACTIONDETAILS: " + action.getActionDetails());
-       		getLogger().info("********************* DETAILS: " + action.getComponentDetails());
-       		getLogger().info("********************* TYPE: " + action.getSourceType());
-       		getLogger().info("********************* OPERATIONS: " + action.getOperation());       		
-       	}*/
     }
     
     public List<Referenceable> discoverNewTags(JSONArray results){
@@ -301,6 +283,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 					String currGranularity = deserializeDataSourceGranularity(currTableName);
 					Referenceable currTagReferenceable = new Referenceable(HistorianDataTypes.HISTORIAN_TAG.getName());
 					currTagReferenceable.set("name",result.getString(currColumnName)+"_"+currGranularity);
+					currTagReferenceable.set("source_name",result.getString(currColumnName));
 					currTagReferenceable.set("qualifiedName",currTableName+"."+currColumnName+"."+result.getString(currColumnName));
 					currTagReferenceable.set("parent_column", currColumnRefId);
 					currTagReferenceable.set("granularity", currGranularity);
@@ -321,6 +304,31 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		}
 		return tagReferenceableList;
 	}
+    
+    public String deserializeDataSourceColumnType(String dataSource, String column){
+    	//Map<String,String> columnTypeMap = new HashMap<String,String>();
+		Map<String,Object>columnMap = dataSourceDetails.get("columns");
+		Map<String,Object>aggregatorMap = dataSourceDetails.get("aggregators");
+		
+		String columnType = null;
+		if(column.equalsIgnoreCase("__time")){
+			columnType = "time";
+			getLogger().debug(("********** Column: " + column + ":" + columnType));
+		}else if(((Map)columnMap.get(column)).get("cardinality") != null){
+			columnType = "dimension";
+			getLogger().debug("********** Column: " + column + ":" + columnType);
+		}else{
+			for(String aggregator:aggregatorMap.keySet()){
+				String metricColumn = ((Map)aggregatorMap.get(aggregator)).get("fieldName").toString();
+				if(metricColumn.equalsIgnoreCase(column)){
+					columnType = ((Map)aggregatorMap.get(aggregator)).get("type").toString();
+					getLogger().debug("********** Column: " + metricColumn + ":" +columnType);
+					break;
+				}
+			}
+		}
+    	return columnType;
+    }
     
     public String deserializeDataSourceGranularity(String dataSource){
     	Map<String,Object> granularityMap = dataSourceDetails.get(dataSource);
@@ -379,7 +387,8 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		String payload = "{\"queryType\":\"segmentMetadata\","
 						+ "\"dataSource\":\""+dataSource+"\","
 						+ "\"intervals\":[\""+dateBefore+"/"+currentDate+"\"],"
-						+ "\"analysisTypes\":[\"queryGranularity\",\"aggregators\",\"rollup\"]"
+						+ "\"analysisTypes\":[\"queryGranularity\",\"aggregators\",\"rollup\"],"
+						+ "\"merge\":\"true\" "
 						+ "}";
 		List<Map<String,Object>> result = null;
 		JSONArray druidSegmentsJSON;
@@ -777,6 +786,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 
         final AttributeDefinition[] attributeDefinitions = new AttributeDefinition[] {
         		new AttributeDefinition(NAME, DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
+        		new AttributeDefinition("source_name", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
         		new AttributeDefinition("granularity", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
         		new AttributeDefinition("parent_column", "hive_column", Multiplicity.OPTIONAL, false, null),
         		new AttributeDefinition("parent_asset", HistorianDataTypes.HISTORIAN_ASSET.getName(), Multiplicity.OPTIONAL, false, null),
