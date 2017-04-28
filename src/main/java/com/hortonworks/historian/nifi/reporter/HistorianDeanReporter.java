@@ -357,7 +357,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 	    	Iterator<String> resultIterator = getDruidDataSourceList().iterator();	
 			while(resultIterator.hasNext()){
 				hiveTableName = resultIterator.next();
-				dataSourceDetails = getDruidDataSourceDetails(hiveTableName);
+				dataSourceDetails.put(hiveTableName, getDruidDataSourceDetails(hiveTableName));
 				getLogger().info("********************* Attempting to create Hive Table from Druid Data Source: " + hiveTableName);
 				hiveConnection.createStatement().execute("CREATE EXTERNAL TABLE IF NOT EXISTS " + hiveTableName + " "
 		    				+ "STORED BY 'org.apache.hadoop.hive.druid.DruidStorageHandler' "
@@ -370,7 +370,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         }
     }
     
-    private Map<String,Map<String, Object>> getDruidDataSourceDetails(String dataSource) {
+    private Map<String, Object> getDruidDataSourceDetails(String dataSource) {
     	String druidSegmentUrl = druidBrokerUrl + "/druid/v2";
     	DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
 		String currentDate = dateFormat.format(new Date()).toString();
@@ -397,7 +397,8 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     	Map<String,Map<String,Object>> dataSourceDetailsMap = new HashMap<String,Map<String,Object>>();
     	dataSourceDetailsMap.put(dataSource, result.get(0));
     	
-    	return dataSourceDetailsMap; 
+    	return result.get(0);
+    	//return dataSourceDetailsMap; 
 	}
 
 	public List<String> getDruidDataSourceList(){
