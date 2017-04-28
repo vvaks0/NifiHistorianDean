@@ -324,6 +324,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     
     public String deserializeDataSourceGranularity(String dataSource){
     	Map<String,Object> granularityMap = dataSourceDetails.get(dataSource);
+    	System.out.println("********** granularityMap: " + granularityMap);
     	String granularityType = ((HashMap)granularityMap.get("queryGranularity")).get("type").toString();
 		String granularity = "";
 		if(granularityType.equalsIgnoreCase("none")){
