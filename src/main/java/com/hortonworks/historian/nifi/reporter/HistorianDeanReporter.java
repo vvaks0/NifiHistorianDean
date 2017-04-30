@@ -49,9 +49,6 @@ import org.codehaus.jettison.json.JSONArray;
 import org.codehaus.jettison.json.JSONException;
 import org.codehaus.jettison.json.JSONObject;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.hortonworks.historian.model.HistorianDataTypes;
@@ -69,22 +66,29 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 
 @Tags({"reporting", "atlas", "historian", "orchestration"})
 @CapabilityDescription("Publishes Historian Tags from Druid to Apache Atlas, Exposes Druid Datasources as Hive Tables, Initiates Druid re-Indexing Jobs on Late Arriving Data.")
 public class HistorianDeanReporter extends AbstractReportingTask {
 
-    static final PropertyDescriptor ATLAS_URL = new PropertyDescriptor.Builder()
+	static final PropertyDescriptor HISTORIAN_TAG_DIMENSION = new PropertyDescriptor.Builder()
+    		.name("Tag Dimension Name")
+    		.description("The name of the dimension field in the Historian data source that contains tags (no spaces)")
+            .required(true)
+            .expressionLanguageSupported(true)
+            .defaultValue("tag_dimension")
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+	static final PropertyDescriptor ATLAS_URL = new PropertyDescriptor.Builder()
             .name("Atlas URL")
             .description("The URL of the Atlas Server")
             .required(true)
@@ -136,7 +140,6 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     private String nifiUrl;
     private String druidBrokerUrl;
     private String hiveServerUri;
-    private String druidMetaUri;
     private String[] basicAuth = {DEFAULT_ADMIN_USER, DEFAULT_ADMIN_PASS};
     
     private DataTypes.MapType STRING_MAP_TYPE = new DataTypes.MapType(DataTypes.STRING_TYPE, DataTypes.STRING_TYPE);
@@ -146,6 +149,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     private String SOURCE = "source";
     private String DESTINATION = "destination";
     private String PROPERTIES = "parameters";
+    private String TAG_DIMENSION_NAME = "tag_dimension";
     
     private Map<String,Map<String, Object>> dataSourceDetails = new HashMap<String,Map<String,Object>>();
     private Map<String, EnumTypeDefinition> enumTypeDefinitionMap = new HashMap<String, EnumTypeDefinition>();
@@ -159,6 +163,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
         final List<PropertyDescriptor> properties = new ArrayList<>();
+        properties.add(HISTORIAN_TAG_DIMENSION);
         properties.add(ATLAS_URL);
         properties.add(NIFI_URL);
         properties.add(HIVE_SERVER_CONNECTION_STRING);
@@ -167,9 +172,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         return properties;
     }
     
-    public void initialize(ConfigurationContext reportingConfig){
-    	
-    }
+    public void initialize(ConfigurationContext reportingConfig){}
     
     @Override
     public void onTrigger(ReportingContext reportingContext) {
@@ -187,6 +190,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         nifiUrl = reportingContext.getProperty(NIFI_URL).getValue();
         druidBrokerUrl = reportingContext.getProperty(DRUID_BROKER_HTTP_ENDPOINT).getValue();
         hiveServerUri = reportingContext.getProperty(HIVE_SERVER_CONNECTION_STRING).getValue();
+        TAG_DIMENSION_NAME = reportingContext.getProperty(HISTORIAN_TAG_DIMENSION).getValue();
         //druidMetaUri = reportingContext.getProperty(DRUID_METASTORE_CONNECTION_STRING).getValue();
         String[] atlasURL = {atlasUrl};
 		
@@ -223,6 +227,8 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         		atlasClient.createType(historianDataModelJSON);
 				getLogger().info("********************* Created Types: " + atlasClient.createType(historianDataModelJSON));
 				
+				updateHiveColumnClassAttributes();
+				
 			} catch (AtlasServiceException e) {
 				e.printStackTrace();
 			} catch (AtlasException e) {
@@ -235,85 +241,74 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         }
         timesTriggered++;
         
-        getLogger().info("********************* Looking for new Druid Datasources to expose as Hive Tables...");
-        exposeDruidDataSourceAsHiveTable();
-        
-        getLogger().info("********************* Cross Reference Atlas to Discover new Tags...");
-        
-		try {
-			String dslQuery = "hive_column is tag_dimension";
-			JSONArray results = atlasClient.searchByDSL(dslQuery);
-			getLogger().debug("***************** result: " + results);
-	        List<Referenceable> tagList = discoverNewTags(results);
-	        atlasClient.createEntity(tagList);
-		} catch (AtlasServiceException e) {
-			e.printStackTrace();
+        getLogger().info("********************* Looking for Druid Datasources to expose as Hive Tables or update with new information...");
+        Iterator<String> resultIterator = getDruidDataSourceList().iterator();
+		while(resultIterator.hasNext()){
+			String dataSource = resultIterator.next();
+			dataSourceDetails.put(dataSource, getDruidDataSourceDetails(dataSource));
+			
+			getLogger().info("********************* Exposing Druid Data Source: " + dataSource);
+			exposeDruidDataSourceAsHiveTable(dataSource);
+			
+			getLogger().info("********************* Update Atlas Hive Tables and Column for Druid Data Source: " + dataSource);
+			updateDataSourceHiveColumnAttributes(dataSource);
 		}
-		
+
 		getLogger().info("********************* Done...");
 		
     }
     
-    public List<Referenceable> discoverNewTags(JSONArray results){
-		String sqlString = null;
-		List<HashMap> referenceablesJSON = null;
-		List<Referenceable> tagReferenceableList = new ArrayList<Referenceable>();
+    public void updateDataSourceHiveColumnAttributes(String dataSource){
+    	String dslQuery = "hive_table where name = '"+dataSource+"'";
+		
 		try {
-			referenceablesJSON = new ObjectMapper().readValue(results.toString(), List.class);
-			Iterator<HashMap> refIterator = referenceablesJSON.iterator();
-			while(refIterator.hasNext()){
-				HashMap currReferenceable = refIterator.next();
-				String currColumnId = ((HashMap)currReferenceable.get("$id$")).get("id").toString();
-				String currColumnVersion = ((HashMap)currReferenceable.get("$id$")).get("version").toString();
-				String currColumnType = ((HashMap)currReferenceable.get("$id$")).get("$typeName$").toString();
-				String currColumnState = ((HashMap)currReferenceable.get("$id$")).get("state").toString();
-				String currColumnName = currReferenceable.get("name").toString();
-				Id currColumnRefId = new Id(currColumnId,Integer.valueOf(currColumnVersion),currColumnType,currColumnState);
-				
-				String tableId = ((HashMap)currReferenceable.get("table")).get("id").toString(); 
-				Referenceable currTable = atlasClient.getEntity(tableId);
-				String currTableName = currTable.get("name").toString();
-				sqlString = " SELECT `"+currColumnName+"`, COUNT(`"+currColumnName+"`)"
-									+ " FROM "+currTableName+" "
-									+ " GROUP BY `"+currColumnName+"`";
-				
-				getLogger().info("********************* Executing Hive Query: " + sqlString);
-				ResultSet result = hiveConnection.createStatement().executeQuery(sqlString);
-				while(result.next()){
-					String currGranularity = deserializeDataSourceGranularity(currTableName);
-					Referenceable currTagReferenceable = new Referenceable(HistorianDataTypes.HISTORIAN_TAG.getName());
-					currTagReferenceable.set("name",result.getString(currColumnName)+"_"+currGranularity);
-					currTagReferenceable.set("source_name",result.getString(currColumnName));
-					currTagReferenceable.set("qualifiedName",currTableName+"."+currColumnName+"."+result.getString(currColumnName));
-					currTagReferenceable.set("parent_column", currColumnRefId);
-					currTagReferenceable.set("granularity", currGranularity);
-					getLogger().info("********************* New Tag Entity: " + InstanceSerialization.toJson(currTagReferenceable,true));
-					tagReferenceableList.add(currTagReferenceable);	
+			JSONArray results = atlasClient.searchByDSL(dslQuery);
+			Map<String,Object> referenceableJSON = new ObjectMapper().readValue(results.get(0).toString(), Map.class);
+			//System.out.println(referenceableJSON);
+			String tableId = ((Map)referenceableJSON.get("$id$")).get("id").toString();
+		
+			Referenceable tableRef = atlasClient.getEntity(tableId);
+			List<Referenceable> columnRefs = (List<Referenceable>) tableRef.getValuesMap().get("columns");
+		
+			Iterator<Referenceable> columnsIterator = columnRefs.iterator();
+			getLogger().info("********************* Discovering Tags and Updating Hive Columns in Atlas: " + dataSource);
+			while(columnsIterator.hasNext()){
+				Referenceable columnRef = columnsIterator.next();
+				getLogger().debug("********** Column Referencebales: " + columnRef);
+				String columnName = columnRef.getValuesMap().get("name").toString();
+				columnRef.set("granularity", deserializeDataSourceGranularity(dataSource));
+				columnRef.set("column_type",deserializeDataSourceColumnType(dataSource,columnName));
+				getLogger().info("********************* Updating Hive Column: " + columnName);
+				if(columnName.equalsIgnoreCase(TAG_DIMENSION_NAME) && columnName.equalsIgnoreCase("NONE")){	
+					getLogger().info("********************* This Column is a Tag_Dimension field, discovering Historian Tags...");
+					atlasClient.updateEntities(discoverNewTags(tableRef,columnRef));
+				}else{
+					atlasClient.updateEntities(columnRef);
 				}
+				getLogger().debug("********** JSON Payload for Column/Tag Update: " + InstanceSerialization.toJson(columnRef, true));
 			}
+    	}catch (AtlasServiceException e) {
+			e.printStackTrace();
 		} catch (JsonParseException e) {
 			e.printStackTrace();
 		} catch (JsonMappingException e) {
 			e.printStackTrace();
 		} catch (IOException e) {
 			e.printStackTrace();
-		} catch (AtlasServiceException e) {
-			e.printStackTrace();
-		} catch (SQLException e) {
+		} catch (JSONException e) {
 			e.printStackTrace();
 		}
-		return tagReferenceableList;
-	}
+    }
     
     public String deserializeDataSourceColumnType(String dataSource, String column){
-    	//Map<String,String> columnTypeMap = new HashMap<String,String>();
-		Map<String,Object>columnMap = dataSourceDetails.get("columns");
-		Map<String,Object>aggregatorMap = dataSourceDetails.get("aggregators");
+		Map<String,Object>dataSourceMap = dataSourceDetails.get(dataSource);
+		Map<String,Object>columnMap = (Map)dataSourceMap.get("columns");
+		Map<String,Object>aggregatorMap = (Map)dataSourceMap.get("aggregators");
 		
 		String columnType = null;
 		if(column.equalsIgnoreCase("__time")){
 			columnType = "time";
-			getLogger().debug(("********** Column: " + column + ":" + columnType));
+			getLogger().debug("********** Column: " + column + ":" + columnType);
 		}else if(((Map)columnMap.get(column)).get("cardinality") != null){
 			columnType = "dimension";
 			getLogger().debug("********** Column: " + column + ":" + columnType);
@@ -321,7 +316,18 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 			for(String aggregator:aggregatorMap.keySet()){
 				String metricColumn = ((Map)aggregatorMap.get(aggregator)).get("fieldName").toString();
 				if(metricColumn.equalsIgnoreCase(column)){
-					columnType = ((Map)aggregatorMap.get(aggregator)).get("type").toString();
+					String storedType = ((Map)aggregatorMap.get(aggregator)).get("type").toString();  
+					if(metricColumn.equalsIgnoreCase("count")){
+						columnType = "count";
+					}else if(storedType.contains("Sum")){
+						columnType = "SUM";
+					}else if(storedType.contains("Min")){
+						columnType = "MIN";
+					}else if(storedType.contains("Max")){
+						columnType = "MAX";
+					}else if(storedType.contains("Avg")){
+						columnType = "AVG";
+					}
 					getLogger().debug("********** Column: " + metricColumn + ":" +columnType);
 					break;
 				}
@@ -329,10 +335,10 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		}
     	return columnType;
     }
-    
-    public String deserializeDataSourceGranularity(String dataSource){
+	
+	public String deserializeDataSourceGranularity(String dataSource){
     	Map<String,Object> granularityMap = dataSourceDetails.get(dataSource);
-    	System.out.println("********** granularityMap: " + granularityMap);
+    	getLogger().debug("********** granularityMap: " + granularityMap);
     	String granularityType = ((HashMap)granularityMap.get("queryGranularity")).get("type").toString();
 		String granularity = "";
 		if(granularityType.equalsIgnoreCase("none")){
@@ -358,27 +364,8 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		}
     	return granularity;
     }
-    
-    public void exposeDruidDataSourceAsHiveTable(){
-	    String hiveTableName = "";
-	    try {
-	    	Iterator<String> resultIterator = getDruidDataSourceList().iterator();	
-			while(resultIterator.hasNext()){
-				hiveTableName = resultIterator.next();
-				dataSourceDetails.put(hiveTableName, getDruidDataSourceDetails(hiveTableName));
-				getLogger().info("********************* Attempting to create Hive Table from Druid Data Source: " + hiveTableName);
-				hiveConnection.createStatement().execute("CREATE EXTERNAL TABLE IF NOT EXISTS " + hiveTableName + " "
-		    				+ "STORED BY 'org.apache.hadoop.hive.druid.DruidStorageHandler' "
-		    				+ "TBLPROPERTIES (\"druid.datasource\" = \"" + hiveTableName + "\")");
-		    }
-	    }catch (SQLException e) {
-			e.printStackTrace();
-		} catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-    
-    private Map<String, Object> getDruidDataSourceDetails(String dataSource) {
+	
+	private Map<String, Object> getDruidDataSourceDetails(String dataSource) {
     	String druidSegmentUrl = druidBrokerUrl + "/druid/v2";
     	DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
 		String currentDate = dateFormat.format(new Date()).toString();
@@ -393,21 +380,19 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		List<Map<String,Object>> result = null;
 		JSONArray druidSegmentsJSON;
 		try {
-			System.out.println("************************ Url: " + druidSegmentUrl);
-			System.out.println("************************ Sending: " + payload);
+			getLogger().debug("************************ Url: " + druidSegmentUrl);
+			getLogger().debug("************************ Sending: " + payload);
 			druidSegmentsJSON = readJSONArrayFromUrlAuthPOST(druidSegmentUrl, basicAuth, payload);
-			System.out.println("************************ Response from Druid: " + druidSegmentsJSON);
+			getLogger().debug("************************ Response from Druid: " + druidSegmentsJSON);
 	    	result = new ObjectMapper().readValue(druidSegmentsJSON.toString(), List.class);
 		} catch (IOException e) {
 			e.printStackTrace();
 		} catch (JSONException e) {
 			e.printStackTrace();
 		}
-    	Map<String,Map<String,Object>> dataSourceDetailsMap = new HashMap<String,Map<String,Object>>();
-    	dataSourceDetailsMap.put(dataSource, result.get(0));
+    	Map<String,Object> dataSourceDetailsMap = (Map)result.get(0);
     	
-    	return result.get(0);
-    	//return dataSourceDetailsMap; 
+    	return dataSourceDetailsMap; 
 	}
 
 	public List<String> getDruidDataSourceList(){
@@ -417,7 +402,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		try {
 			getLogger().info("********************* Getting List of Druid Datasources from API: " + druidDataSourceUrl);
 			druidDataSourceJSON = readJSONArrayFromUrlAuth(druidDataSourceUrl, basicAuth);
-			getLogger().info("************************ Response from Druid: " + druidDataSourceJSON);
+			getLogger().debug("************************ Response from Druid: " + druidDataSourceJSON);
 	    	result = new ObjectMapper().readValue(druidDataSourceJSON.toString(), List.class);
 		} catch (IOException e) {
 			e.printStackTrace();
@@ -426,6 +411,106 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		}
     	
     	return result;
+    }
+	
+	public List<Referenceable> discoverNewTags(Referenceable tableRef, Referenceable columnRef){
+		String sqlString = null;
+		List<Referenceable> tagReferenceableList = new ArrayList<Referenceable>();
+		List<Id> tagIdList = new ArrayList<Id>();
+		try {
+			Id currColumnRefId = columnRef.getId();
+			String currColumnName = columnRef.getValuesMap().get("name").toString();
+			String currTableName = tableRef.get("name").toString();
+			sqlString = " SELECT `"+currColumnName+"`, COUNT(`"+currColumnName+"`)"
+									+ " FROM "+currTableName+" "
+									+ " GROUP BY `"+currColumnName+"`";
+				
+			getLogger().debug("********************* Executing Hive Query: " + sqlString);
+			ResultSet result = hiveConnection.createStatement().executeQuery(sqlString);
+			while(result.next()){
+				String currGranularity = deserializeDataSourceGranularity(currTableName);
+				Referenceable currTagReferenceable = new Referenceable(HistorianDataTypes.HISTORIAN_TAG.getName());
+				currTagReferenceable.set("name",result.getString(currColumnName));
+				currTagReferenceable.set("qualifiedName",currTableName+"."+currColumnName+"."+result.getString(currColumnName));
+				currTagReferenceable.set("parent_column", currColumnRefId);
+				currTagReferenceable.set("granularity", currGranularity);
+				getLogger().debug("********************* New Tag Entity: " + InstanceSerialization.toJson(currTagReferenceable,true));
+				tagReferenceableList.add(currTagReferenceable);	
+				tagIdList.add(currTagReferenceable.getId());
+			}
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}
+		columnRef.set("historian_tags", tagIdList);
+		tagReferenceableList.add(columnRef);
+		return tagReferenceableList;
+	}
+	
+	public List<Referenceable> discoverNewTags(JSONArray results){
+		String sqlString = null;
+		List<HashMap> referenceablesJSON = null;
+		List<Referenceable> tagReferenceableList = new ArrayList<Referenceable>();
+		try {
+			referenceablesJSON = new ObjectMapper().readValue(results.toString(), List.class);
+			Iterator<HashMap> refIterator = referenceablesJSON.iterator();
+			while(refIterator.hasNext()){
+				HashMap currReferenceable = refIterator.next();
+				String currColumnId = ((HashMap)currReferenceable.get("$id$")).get("id").toString();
+				String currColumnVersion = ((HashMap)currReferenceable.get("$id$")).get("version").toString();
+				String currColumnType = ((HashMap)currReferenceable.get("$id$")).get("$typeName$").toString();
+				String currColumnState = ((HashMap)currReferenceable.get("$id$")).get("state").toString();
+				String currColumnName = currReferenceable.get("name").toString();
+				Id currColumnRefId = new Id(currColumnId,Integer.valueOf(currColumnVersion),currColumnType,currColumnState);
+				
+				String tableId = ((HashMap)currReferenceable.get("table")).get("id").toString(); 
+				Referenceable currTable = atlasClient.getEntity(tableId);
+				String currTableName = currTable.get("name").toString();
+				sqlString = " SELECT `"+currColumnName+"`, COUNT(`"+currColumnName+"`)"
+									+ " FROM "+currTableName+" "
+									+ " GROUP BY `"+currColumnName+"`";
+				
+				System.out.println("********************* Executing Hive Query: " + sqlString);
+				ResultSet result = hiveConnection.createStatement().executeQuery(sqlString);
+				while(result.next()){
+					String currGranularity = deserializeDataSourceGranularity(currTableName);
+					Referenceable currTagReferenceable = new Referenceable(HistorianDataTypes.HISTORIAN_TAG.getName());
+					currTagReferenceable.set("name",result.getString(currColumnName)+"_"+currGranularity);
+					currTagReferenceable.set("source_name",result.getString(currColumnName));
+					currTagReferenceable.set("qualifiedName",currTableName+"."+currColumnName+"."+result.getString(currColumnName));
+					currTagReferenceable.set("parent_column", currColumnRefId);
+					currTagReferenceable.set("granularity", currGranularity);
+					System.out.println("********************* New Tag Entity: " + InstanceSerialization.toJson(currTagReferenceable,true));
+					tagReferenceableList.add(currTagReferenceable);	
+				}
+			}
+		} catch (JsonParseException e) {
+			e.printStackTrace();
+		} catch (JsonMappingException e) {
+			e.printStackTrace();
+		} catch (IOException e) {
+			e.printStackTrace();
+		} catch (AtlasServiceException e) {
+			e.printStackTrace();
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}
+		return tagReferenceableList;
+	}
+    
+    public void exposeDruidDataSourceAsHiveTable(String dataSource){
+	    String hiveTableName = "";
+	    try {
+	    	hiveTableName = dataSource;
+	    	dataSourceDetails.put(hiveTableName, getDruidDataSourceDetails(hiveTableName));
+	    	getLogger().info("********************* Attempting to create Hive Table from Druid Data Source: " + hiveTableName);
+	    	hiveConnection.createStatement().execute("CREATE EXTERNAL TABLE IF NOT EXISTS " + hiveTableName + " "
+		    				+ "STORED BY 'org.apache.hadoop.hive.druid.DruidStorageHandler' "
+		    				+ "TBLPROPERTIES (\"druid.datasource\" = \"" + hiveTableName + "\")");
+	    }catch (SQLException e) {
+			e.printStackTrace();
+		} catch (Exception e) {
+            e.printStackTrace();
+        }
     }
     
 	private JSONArray readJSONArrayFromUrlAuthPOST(String urlString, String[] basicAuth, String payload) throws IOException, JSONException {
@@ -459,6 +544,227 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         }
         return jsonArray;
     }
+	
+	private void updateHiveColumnClassAttributes() throws AtlasException {
+        final String typeName = "hive_column";
+
+		try {
+			TypesDef hiveColumnType = atlasClient.getType(typeName);
+			AttributeDefinition[] attributes = hiveColumnType.classTypesAsJavaList().get(0).attributeDefinitions;
+			ImmutableSet<String> superTypes = hiveColumnType.classTypesAsJavaList().get(0).superTypes;
+			AttributeDefinition[] attributeDefinitions = Arrays.copyOf(attributes, attributes.length+3);
+			attributeDefinitions[attributes.length] = new AttributeDefinition("column_type", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null);
+			attributeDefinitions[attributes.length+1] = new AttributeDefinition("granularity", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null);
+			attributeDefinitions[attributes.length+2] = new AttributeDefinition("historian_tags", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_TAG.getName()), Multiplicity.OPTIONAL, false, null);
+			
+			HierarchicalTypeDefinition<ClassType> updateClass = TypesUtil.createClassTypeDef(typeName, superTypes, attributeDefinitions);
+			getLogger().info("********** Updating " + typeName + " definition: " + TypesSerialization.toJson(updateClass,false));
+			atlasClient.updateType(TypesSerialization.toJson(updateClass,false));
+		} catch (AtlasServiceException e) {
+			e.printStackTrace();
+		}
+        //addClassTypeUpdateDefinition(typeName, ImmutableSet.of(AtlasClient.REFERENCEABLE_SUPER_TYPE), attributeDefinitions);
+        getLogger().info("Updated definition for " + typeName);
+    }
+	
+	public String generateHistorianDataModel() throws AtlasException {
+    	TypesDef typesDef;
+		String historianDataModelJSON;
+		System.out.println("***************** generate data model method call...");
+    	try {
+			atlasClient.getType(HistorianDataTypes.HISTORIAN_ASSET.getName());
+			getLogger().info("********************* Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_ASSET.getName() + " is already present");
+		} catch (AtlasServiceException e) {
+			System.out.println("***************** create asset class...");
+			createAssetClass();
+		}
+		
+		try {
+			atlasClient.getType(HistorianDataTypes.HISTORIAN_TAG.getName());
+			getLogger().info("********************* Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_TAG.getName() + " is already present");
+		} catch (AtlasServiceException e) {
+			System.out.println("***************** create tag class...");
+			createTagClass();
+		}
+		
+		try {
+			atlasClient.getType(HistorianDataTypes.HISTORIAN_TAG_ATTRIBUTE.getName());
+			getLogger().info("********************* Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_TAG.getName() + " is already present");
+		} catch (AtlasServiceException e) {
+			System.out.println("***************** create tag attribute class...");
+			createTagAttributeClass();
+		}
+		
+		typesDef = TypesUtil.getTypesDef(
+				getEnumTypeDefinitions(), 	//Enums 
+				getStructTypeDefinitions(), //Struct 
+				getTraitTypeDefinitions(), 	//Traits 
+				ImmutableList.copyOf(classTypeDefinitions.values()));
+		
+		historianDataModelJSON = TypesSerialization.toJson(typesDef);
+		
+		getLogger().info("Submitting Types Definition: " + historianDataModelJSON);
+		getLogger().info("Generating the Historian Data Model....");
+		return historianDataModelJSON;
+    }
+
+    private void createAssetClass() throws AtlasException {
+        final String typeName = HistorianDataTypes.HISTORIAN_ASSET.getName();
+        
+        final AttributeDefinition[] attributeDefinitions = new AttributeDefinition[] {
+        		new AttributeDefinition(NAME, DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
+        		new AttributeDefinition("parent_assets", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_ASSET.getName()), Multiplicity.OPTIONAL, false, null),
+                new AttributeDefinition("child_assets", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_ASSET.getName()), Multiplicity.OPTIONAL, false, null),
+                new AttributeDefinition("historian_tags", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_TAG.getName()), Multiplicity.OPTIONAL, true, null)
+        };
+        
+        addClassTypeDefinition(typeName, ImmutableSet.of(AtlasClient.REFERENCEABLE_SUPER_TYPE), attributeDefinitions);
+        getLogger().info("Created definition for " + typeName);
+    }
+
+    private void createTagClass() throws  AtlasException {
+        final String typeName = HistorianDataTypes.HISTORIAN_TAG.getName();
+
+        final AttributeDefinition[] attributeDefinitions = new AttributeDefinition[] {
+        		new AttributeDefinition(NAME, DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
+        		new AttributeDefinition("granularity", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
+        		new AttributeDefinition("parent_column", "hive_column", Multiplicity.OPTIONAL, false, null),
+        		new AttributeDefinition("parent_asset", HistorianDataTypes.HISTORIAN_ASSET.getName(), Multiplicity.OPTIONAL, false, null),
+                new AttributeDefinition("tags_attributes", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_TAG_ATTRIBUTE.getName()), Multiplicity.OPTIONAL, true, null)
+        };
+
+        addClassTypeDefinition(typeName, ImmutableSet.of(AtlasClient.REFERENCEABLE_SUPER_TYPE), attributeDefinitions);
+        getLogger().info("Created definition for " + typeName);
+    }
+
+    private void createTagAttributeClass() throws AtlasException {
+        final String typeName = HistorianDataTypes.HISTORIAN_TAG_ATTRIBUTE.getName();
+
+        final AttributeDefinition[] attributeDefinitions = new AttributeDefinition[] {
+        		new AttributeDefinition(NAME, DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
+        		new AttributeDefinition("associated_tags", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_TAG.getName()), Multiplicity.OPTIONAL, false, null),
+                new AttributeDefinition(PROPERTIES, STRING_MAP_TYPE.getName(), Multiplicity.OPTIONAL, false, null)
+        };
+
+        addClassTypeDefinition(typeName, ImmutableSet.of(AtlasClient.REFERENCEABLE_SUPER_TYPE), attributeDefinitions);
+        getLogger().info("Created definition for " + typeName);
+    }
+
+    private void addClassTypeDefinition(String typeName, ImmutableSet<String> superTypes, AttributeDefinition[] attributeDefinitions) {
+        final HierarchicalTypeDefinition<ClassType> definition =
+                new HierarchicalTypeDefinition<>(ClassType.class, typeName, null, superTypes, attributeDefinitions);
+
+        classTypeDefinitions.put(typeName, definition);
+    }
+    
+    public TypesDef getTypesDef() {
+        return TypesUtil.getTypesDef(getEnumTypeDefinitions(), getStructTypeDefinitions(), getTraitTypeDefinitions(), getClassTypeDefinitions());
+    }
+
+    public String getDataModelAsJSON() {
+        return TypesSerialization.toJson(getTypesDef());
+    }
+
+    public ImmutableList<EnumTypeDefinition> getEnumTypeDefinitions() {
+        return ImmutableList.copyOf(enumTypeDefinitionMap.values());
+    }
+
+    public ImmutableList<StructTypeDefinition> getStructTypeDefinitions() {
+        return ImmutableList.copyOf(structTypeDefinitionMap.values());
+    }
+
+    public ImmutableList<HierarchicalTypeDefinition<ClassType>> getClassTypeDefinitions() {
+        return ImmutableList.copyOf(classTypeDefinitions.values());
+    }
+
+    public ImmutableList<HierarchicalTypeDefinition<TraitType>> getTraitTypeDefinitions() {
+        return ImmutableList.of();
+    }
+	
+	private String getAtlasVersion(String urlString, String[] basicAuth){
+		getLogger().info("************************ Getting Atlas Version from: " + urlString);
+		JSONObject json = null;
+		String versionValue = null;
+        try{
+        	json = readJSONFromUrlAuth(urlString, basicAuth);
+        	getLogger().info("************************ Response from Atlas: " + json);
+        	versionValue = json.getString("Version");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+		return versionValue.substring(0,3);
+	}
+	
+	private HashMap<String, Object> getProcessorConfig(String processorId, String urlString, String[] basicAuth){
+		String processorResourceUri = "/nifi-api/processors/";
+		String nifiProcessorUrl = urlString+processorResourceUri+processorId;
+		System.out.println("************************ Getting Nifi Processor from: " + nifiProcessorUrl);
+		JSONObject json = null;
+		JSONObject nifiComponentJSON = null;
+		HashMap<String,Object> result = null;
+        try{
+        	json = readJSONFromUrlAuth(nifiProcessorUrl, basicAuth);
+        	System.out.println("************************ Response from Nifi: " + json);
+        	nifiComponentJSON = json.getJSONObject("component").getJSONObject("config").getJSONObject("properties");
+        	result = new ObjectMapper().readValue(nifiComponentJSON.toString(), HashMap.class);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+       
+		return result;
+	}
+	
+	private JSONObject readJSONFromUrlAuth(String urlString, String[] basicAuth) throws IOException, JSONException {
+		String userPassString = basicAuth[0]+":"+basicAuth[1];
+		JSONObject json = null;
+		try {
+            URL url = new URL (urlString);
+            //Base64.encodeBase64String(userPassString.getBytes());
+
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("GET");
+            connection.setDoOutput(true);
+            connection.setRequestProperty  ("Authorization", "Basic " + encoding);
+            InputStream content = (InputStream)connection.getInputStream();
+            BufferedReader rd = new BufferedReader(new InputStreamReader(content, Charset.forName("UTF-8")));
+  	      	String jsonText = readAll(rd);
+  	      	json = new JSONObject(jsonText);
+        } catch(Exception e) {
+            e.printStackTrace();
+        }
+        return json;
+    }
+	
+	private JSONArray readJSONArrayFromUrlAuth(String urlString, String[] basicAuth) throws IOException, JSONException {
+		String userPassString = basicAuth[0]+":"+basicAuth[1];
+		JSONObject json = null;
+		JSONArray jsonArray = null;
+		try {
+            URL url = new URL (urlString);
+            //Base64.encodeBase64String(userPassString.getBytes());
+
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("GET");
+            connection.setDoOutput(true);
+            connection.setRequestProperty  ("Authorization", "Basic " + encoding);
+            InputStream content = (InputStream)connection.getInputStream();
+            BufferedReader rd = new BufferedReader(new InputStreamReader(content, Charset.forName("UTF-8")));
+  	      	String jsonText = readAll(rd);
+  	      	jsonArray = new JSONArray(jsonText);
+        } catch(Exception e) {
+            e.printStackTrace();
+        }
+        return jsonArray;
+    }
+	
+	private String readAll(Reader rd) throws IOException {
+	    StringBuilder sb = new StringBuilder();
+	    int cp;
+	    while ((cp = rd.read()) != -1) {
+	      sb.append((char) cp);
+	    }
+	    return sb.toString();
+	}
 	
 	public void registerHistorianMetaData(){
 		System.out.println("***************** Creating Meta Data Entities...");
@@ -615,8 +921,6 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 	}
 	
 	public void associateEntities() throws AtlasException {
-		List<Id> tags_truck_a = new ArrayList<Id>();
-		List<Id> tags_truck_b = new ArrayList<Id>();
 		List<Id> trucks_mine_a = new ArrayList<Id>();
 		List<Id> trucks_mine_b = new ArrayList<Id>();
 		List<Id> mines_truck_a = new ArrayList<Id>();
@@ -625,24 +929,10 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		System.out.println(entityMap);
 		
 		try {
-			Referenceable tag_rpm_a = (Referenceable)entityMap.get("tag_rpm_a");
-			Referenceable tag_rpm_b = (Referenceable)entityMap.get("tag_rpm_b");
-			Referenceable tag_mpg_a = (Referenceable)entityMap.get("tag_mpg_a");
-			Referenceable tag_mpg_b = (Referenceable)entityMap.get("tag_mpg_b");
 			Referenceable truck_a = (Referenceable)entityMap.get("truck_a");
 			Referenceable truck_b = (Referenceable)entityMap.get("truck_b");
 			Referenceable mine_a = (Referenceable)entityMap.get("mine_a");
 			Referenceable mine_b = (Referenceable)entityMap.get("mine_b");
-			
-			if(entityMap.get("tag_mpg_a_id") != null && entityMap.get("tag_rpm_a_id") != null){
-				tags_truck_a.add((Id)entityMap.get("tag_mpg_a_id"));
-				tags_truck_a.add((Id)entityMap.get("tag_rpm_a_id"));
-			}
-			
-			if(entityMap.get("tag_mpg_b_id") != null && entityMap.get("tag_mpg_b_id") != null){
-				tags_truck_b.add((Id)entityMap.get("tag_mpg_b_id"));
-				tags_truck_b.add((Id)entityMap.get("tag_rpm_b_id"));
-			}
 			
 			if(entityMap.get("truck_a_id") != null && 
 			   entityMap.get("truck_b_id") != null &&
@@ -655,41 +945,17 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				
 				truck_a.set("parent_assets", mines_truck_a);
 				truck_a.set("child_assets", null);
-				truck_a.set("historian_tags", tags_truck_a);
+				truck_a.set("historian_tags", null);
 				
 				truck_b.set("parent_assets", mines_truck_b);
 				truck_b.set("child_assets", null);
-				truck_b.set("historian_tags", tags_truck_b);
+				truck_b.set("historian_tags", null);
 				
 				System.out.println("***************** " + InstanceSerialization.toJson(truck_a,true));
 				System.out.println("***************** " + InstanceSerialization.toJson(truck_b,true));
 				
 				atlasClient.updateEntities(truck_a);
 				atlasClient.updateEntities(truck_b);
-			}
-			
-			if(entityMap.get("truck_a_id") != null){
-				tag_rpm_a.set("parent_asset", (Id)entityMap.get("truck_a_id"));
-				tag_rpm_a.set("tag_attributes", null);
-				tag_mpg_a.set("parent_asset", (Id)entityMap.get("truck_a_id"));
-				tag_mpg_a.set("tag_attributes", null);
-				
-				System.out.println("***************** " + InstanceSerialization.toJson(tag_mpg_a,true));
-				System.out.println("***************** " + InstanceSerialization.toJson(tag_rpm_a,true));
-				atlasClient.updateEntities(tag_rpm_a);
-				atlasClient.updateEntities(tag_mpg_a);
-			}
-			
-			if(entityMap.get("truck_b_id") != null){
-				tag_rpm_b.set("parent_asset", (Id)entityMap.get("truck_b_id"));
-				tag_rpm_b.set("tag_attributes", null);
-				tag_mpg_b.set("parent_asset", (Id)entityMap.get("truck_b_id"));
-				tag_mpg_b.set("tag_attributes", null);
-				
-				System.out.println("***************** " + InstanceSerialization.toJson(tag_mpg_b,true));
-				System.out.println("***************** " + InstanceSerialization.toJson(tag_rpm_b,true));
-				atlasClient.updateEntities(tag_rpm_b);
-				atlasClient.updateEntities(tag_mpg_b);
 			}
 			
 			if(entityMap.get("mine_a_id") != null && entityMap.get("mine_b_id") != null){
@@ -717,212 +983,12 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     
 	public void deleteHistorianData(){
 		try {
-			atlasClient.getEntity(HistorianDataTypes.HISTORIAN_ASSET.getName(), AtlasClient.REFERENCEABLE_ATTRIBUTE_NAME, "historian_asset.mine_a");
-			atlasClient.getEntity(HistorianDataTypes.HISTORIAN_ASSET.getName(), AtlasClient.REFERENCEABLE_ATTRIBUTE_NAME, "historian_asset.mine_b");
-			//atlasClient.deleteEntity("historian_asset", AtlasClient.REFERENCEABLE_ATTRIBUTE_NAME, "historian_asset.truck_a");
-			//atlasClient.deleteEntity("historian_asset", AtlasClient.REFERENCEABLE_ATTRIBUTE_NAME, "historian_asset.truck_b");
+			atlasClient.deleteEntity(HistorianDataTypes.HISTORIAN_ASSET.getName(), AtlasClient.REFERENCEABLE_ATTRIBUTE_NAME, "historian_asset.mine_a");
+			atlasClient.deleteEntity(HistorianDataTypes.HISTORIAN_ASSET.getName(), AtlasClient.REFERENCEABLE_ATTRIBUTE_NAME, "historian_asset.mine_b");
+			atlasClient.deleteEntity(HistorianDataTypes.HISTORIAN_ASSET.getName(), AtlasClient.REFERENCEABLE_ATTRIBUTE_NAME, "historian_asset.truck_a");
+			atlasClient.deleteEntity(HistorianDataTypes.HISTORIAN_ASSET.getName(), AtlasClient.REFERENCEABLE_ATTRIBUTE_NAME, "historian_asset.truck_b");
 		} catch (AtlasServiceException e) {
 			e.printStackTrace();
 		}
-	}
-	
-	public String generateHistorianDataModel() throws AtlasException {
-    	TypesDef typesDef;
-		String historianDataModelJSON;
-		System.out.println("***************** generate data model method call...");
-    	try {
-			atlasClient.getType(HistorianDataTypes.HISTORIAN_ASSET.getName());
-			getLogger().info("********************* Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_ASSET.getName() + " is already present");
-		} catch (AtlasServiceException e) {
-			System.out.println("***************** create asset class...");
-			createAssetClass();
-		}
-		
-		try {
-			atlasClient.getType(HistorianDataTypes.HISTORIAN_TAG.getName());
-			getLogger().info("********************* Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_TAG.getName() + " is already present");
-		} catch (AtlasServiceException e) {
-			System.out.println("***************** create tag class...");
-			createTagClass();
-		}
-		
-		try {
-			atlasClient.getType(HistorianDataTypes.HISTORIAN_TAG_ATTRIBUTE.getName());
-			getLogger().info("********************* Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_TAG.getName() + " is already present");
-		} catch (AtlasServiceException e) {
-			System.out.println("***************** create tag attribute class...");
-			createTagAttributeClass();
-		}
-		
-		typesDef = TypesUtil.getTypesDef(
-				getEnumTypeDefinitions(), 	//Enums 
-				getStructTypeDefinitions(), //Struct 
-				getTraitTypeDefinitions(), 	//Traits 
-				ImmutableList.copyOf(classTypeDefinitions.values()));
-		
-		historianDataModelJSON = TypesSerialization.toJson(typesDef);
-		
-		getLogger().info("Submitting Types Definition: " + historianDataModelJSON);
-		getLogger().info("Generating the Historian Data Model....");
-		return historianDataModelJSON;
-    }
-
-    private void createAssetClass() throws AtlasException {
-        final String typeName = HistorianDataTypes.HISTORIAN_ASSET.getName();
-        
-        final AttributeDefinition[] attributeDefinitions = new AttributeDefinition[] {
-        		new AttributeDefinition(NAME, DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
-        		new AttributeDefinition("parent_assets", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_ASSET.getName()), Multiplicity.OPTIONAL, false, null),
-                new AttributeDefinition("child_assets", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_ASSET.getName()), Multiplicity.OPTIONAL, false, null),
-                new AttributeDefinition("historian_tags", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_TAG.getName()), Multiplicity.OPTIONAL, true, null)
-        };
-        
-        addClassTypeDefinition(typeName, ImmutableSet.of(AtlasClient.REFERENCEABLE_SUPER_TYPE), attributeDefinitions);
-        getLogger().info("Created definition for " + typeName);
-    }
-
-    private void createTagClass() throws  AtlasException {
-        final String typeName = HistorianDataTypes.HISTORIAN_TAG.getName();
-
-        final AttributeDefinition[] attributeDefinitions = new AttributeDefinition[] {
-        		new AttributeDefinition(NAME, DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
-        		new AttributeDefinition("source_name", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
-        		new AttributeDefinition("granularity", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
-        		new AttributeDefinition("parent_column", "hive_column", Multiplicity.OPTIONAL, false, null),
-        		new AttributeDefinition("parent_asset", HistorianDataTypes.HISTORIAN_ASSET.getName(), Multiplicity.OPTIONAL, false, null),
-                new AttributeDefinition("tags_attributes", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_TAG_ATTRIBUTE.getName()), Multiplicity.OPTIONAL, true, null)
-        };
-
-        addClassTypeDefinition(typeName, ImmutableSet.of(AtlasClient.REFERENCEABLE_SUPER_TYPE), attributeDefinitions);
-        getLogger().info("Created definition for " + typeName);
-    }
-
-    private void createTagAttributeClass() throws AtlasException {
-        final String typeName = HistorianDataTypes.HISTORIAN_TAG_ATTRIBUTE.getName();
-
-        final AttributeDefinition[] attributeDefinitions = new AttributeDefinition[] {
-        		new AttributeDefinition(NAME, DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null),
-        		new AttributeDefinition("associated_tags", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_TAG.getName()), Multiplicity.OPTIONAL, false, null),
-                new AttributeDefinition(PROPERTIES, STRING_MAP_TYPE.getName(), Multiplicity.OPTIONAL, false, null)
-        };
-
-        addClassTypeDefinition(typeName, ImmutableSet.of(AtlasClient.REFERENCEABLE_SUPER_TYPE), attributeDefinitions);
-        getLogger().info("Created definition for " + typeName);
-    }
-
-    private void addClassTypeDefinition(String typeName, ImmutableSet<String> superTypes, AttributeDefinition[] attributeDefinitions) {
-        final HierarchicalTypeDefinition<ClassType> definition =
-                new HierarchicalTypeDefinition<>(ClassType.class, typeName, null, superTypes, attributeDefinitions);
-
-        classTypeDefinitions.put(typeName, definition);
-    }
-    
-    public TypesDef getTypesDef() {
-        return TypesUtil.getTypesDef(getEnumTypeDefinitions(), getStructTypeDefinitions(), getTraitTypeDefinitions(), getClassTypeDefinitions());
-    }
-
-    public String getDataModelAsJSON() {
-        return TypesSerialization.toJson(getTypesDef());
-    }
-
-    public ImmutableList<EnumTypeDefinition> getEnumTypeDefinitions() {
-        return ImmutableList.copyOf(enumTypeDefinitionMap.values());
-    }
-
-    public ImmutableList<StructTypeDefinition> getStructTypeDefinitions() {
-        return ImmutableList.copyOf(structTypeDefinitionMap.values());
-    }
-
-    public ImmutableList<HierarchicalTypeDefinition<ClassType>> getClassTypeDefinitions() {
-        return ImmutableList.copyOf(classTypeDefinitions.values());
-    }
-
-    public ImmutableList<HierarchicalTypeDefinition<TraitType>> getTraitTypeDefinitions() {
-        return ImmutableList.of();
-    }
-	
-	private String getAtlasVersion(String urlString, String[] basicAuth){
-		getLogger().info("************************ Getting Atlas Version from: " + urlString);
-		JSONObject json = null;
-		String versionValue = null;
-        try{
-        	json = readJSONFromUrlAuth(urlString, basicAuth);
-        	getLogger().info("************************ Response from Atlas: " + json);
-        	versionValue = json.getString("Version");
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-		return versionValue.substring(0,3);
-	}
-	
-	private HashMap<String, Object> getProcessorConfig(String processorId, String urlString, String[] basicAuth){
-		String processorResourceUri = "/nifi-api/processors/";
-		String nifiProcessorUrl = urlString+processorResourceUri+processorId;
-		System.out.println("************************ Getting Nifi Processor from: " + nifiProcessorUrl);
-		JSONObject json = null;
-		JSONObject nifiComponentJSON = null;
-		HashMap<String,Object> result = null;
-        try{
-        	json = readJSONFromUrlAuth(nifiProcessorUrl, basicAuth);
-        	System.out.println("************************ Response from Nifi: " + json);
-        	nifiComponentJSON = json.getJSONObject("component").getJSONObject("config").getJSONObject("properties");
-        	result = new ObjectMapper().readValue(nifiComponentJSON.toString(), HashMap.class);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-       
-		return result;
-	}
-	
-	private JSONObject readJSONFromUrlAuth(String urlString, String[] basicAuth) throws IOException, JSONException {
-		String userPassString = basicAuth[0]+":"+basicAuth[1];
-		JSONObject json = null;
-		try {
-            URL url = new URL (urlString);
-            //Base64.encodeBase64String(userPassString.getBytes());
-
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod("GET");
-            connection.setDoOutput(true);
-            connection.setRequestProperty  ("Authorization", "Basic " + encoding);
-            InputStream content = (InputStream)connection.getInputStream();
-            BufferedReader rd = new BufferedReader(new InputStreamReader(content, Charset.forName("UTF-8")));
-  	      	String jsonText = readAll(rd);
-  	      	json = new JSONObject(jsonText);
-        } catch(Exception e) {
-            e.printStackTrace();
-        }
-        return json;
-    }
-	
-	private JSONArray readJSONArrayFromUrlAuth(String urlString, String[] basicAuth) throws IOException, JSONException {
-		String userPassString = basicAuth[0]+":"+basicAuth[1];
-		JSONObject json = null;
-		JSONArray jsonArray = null;
-		try {
-            URL url = new URL (urlString);
-            //Base64.encodeBase64String(userPassString.getBytes());
-
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod("GET");
-            connection.setDoOutput(true);
-            connection.setRequestProperty  ("Authorization", "Basic " + encoding);
-            InputStream content = (InputStream)connection.getInputStream();
-            BufferedReader rd = new BufferedReader(new InputStreamReader(content, Charset.forName("UTF-8")));
-  	      	String jsonText = readAll(rd);
-  	      	jsonArray = new JSONArray(jsonText);
-        } catch(Exception e) {
-            e.printStackTrace();
-        }
-        return jsonArray;
-    }
-	
-	private String readAll(Reader rd) throws IOException {
-	    StringBuilder sb = new StringBuilder();
-	    int cp;
-	    while ((cp = rd.read()) != -1) {
-	      sb.append((char) cp);
-	    }
-	    return sb.toString();
 	}
 }
