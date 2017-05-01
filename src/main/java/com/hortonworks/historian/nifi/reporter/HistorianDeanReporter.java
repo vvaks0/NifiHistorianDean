@@ -276,10 +276,12 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				Referenceable columnRef = columnsIterator.next();
 				getLogger().debug("********** Column Referencebales: " + columnRef);
 				String columnName = columnRef.getValuesMap().get("name").toString();
-				columnRef.set("granularity", deserializeDataSourceGranularity(dataSource));
-				columnRef.set("column_type",deserializeDataSourceColumnType(dataSource,columnName));
+				String granularity = deserializeDataSourceGranularity(dataSource);
+				String column_type = deserializeDataSourceColumnType(dataSource,columnName);
+				columnRef.set("granularity", granularity);
+				columnRef.set("column_type", column_type);
 				getLogger().info("********************* Updating Hive Column: " + columnName);
-				if(columnName.equalsIgnoreCase(TAG_DIMENSION_NAME) && columnName.equalsIgnoreCase("NONE")){	
+				if(columnName.equalsIgnoreCase(TAG_DIMENSION_NAME) && granularity.equalsIgnoreCase("NONE")){	
 					getLogger().info("********************* This Column is a Tag_Dimension field, discovering Historian Tags...");
 					atlasClient.updateEntities(discoverNewTags(tableRef,columnRef));
 				}else{
