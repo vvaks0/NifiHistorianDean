@@ -376,7 +376,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		
 		String payload = "{\"queryType\":\"segmentMetadata\","
 						+ "\"dataSource\":\""+dataSource+"\","
-						+ "\"intervals\":[\""+dateBefore+"/"+currentDate+"\"],"
+						//+ "\"intervals\":[\""+dateBefore+"/"+currentDate+"\"],"
 						+ "\"analysisTypes\":[\"queryGranularity\",\"aggregators\",\"rollup\"],"
 						+ "\"merge\":\"true\" "
 						+ "}";
