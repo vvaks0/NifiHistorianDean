@@ -215,13 +215,14 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         		hiveConnection = DriverManager.getConnection(hiveServerUri, hiveUsername, hivePassword);
 				
 				getLogger().info("********************* Checking if data model has been created...");
+				/*
 				try {
 					atlasClient.getType(HistorianDataTypes.TAG_DIMENSION.getName());
 					getLogger().info("********************* Trait: " + HistorianDataTypes.TAG_DIMENSION.getName() + " is already present");
 				} catch (AtlasServiceException e) {
 					getLogger().info("***************** Creating " + HistorianDataTypes.TAG_DIMENSION.getName() + " Trait...");
 					atlasClient.createTraitType(HistorianDataTypes.TAG_DIMENSION.getName());
-				}
+				}*/
 				String historianDataModelJSON = generateHistorianDataModel();
         		getLogger().info("***************** Historian Data Model as JSON = " + historianDataModelJSON);
         		atlasClient.createType(historianDataModelJSON);
