@@ -278,9 +278,11 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				getLogger().debug("********** Column Referencebales: " + columnRef);
 				String columnName = columnRef.getValuesMap().get("name").toString();
 				String granularity = deserializeDataSourceGranularity(dataSource);
-				String column_type = deserializeDataSourceColumnType(dataSource,columnName);
+				String column_function = deserializeDataSourceColumnType(dataSource,columnName);
+				String column_type = column_function.equalsIgnoreCase("time") || column_function.equalsIgnoreCase("dimension") ?  column_function : "metric"; 
 				columnRef.set("granularity", granularity);
 				columnRef.set("column_type", column_type);
+				columnRef.set("column_function", column_function);
 				getLogger().info("********************* Updating Hive Column: " + columnName);
 				if(columnName.equalsIgnoreCase(TAG_DIMENSION_NAME) && granularity.equalsIgnoreCase("NONE")){	
 					getLogger().info("********************* This Column is a Tag_Dimension field, discovering Historian Tags...");
@@ -478,7 +480,6 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 					String currGranularity = deserializeDataSourceGranularity(currTableName);
 					Referenceable currTagReferenceable = new Referenceable(HistorianDataTypes.HISTORIAN_TAG.getName());
 					currTagReferenceable.set("name",result.getString(currColumnName)+"_"+currGranularity);
-					currTagReferenceable.set("source_name",result.getString(currColumnName));
 					currTagReferenceable.set("qualifiedName",currTableName+"."+currColumnName+"."+result.getString(currColumnName));
 					currTagReferenceable.set("parent_column", currColumnRefId);
 					currTagReferenceable.set("granularity", currGranularity);
@@ -555,10 +556,11 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 			TypesDef hiveColumnType = atlasClient.getType(typeName);
 			AttributeDefinition[] attributes = hiveColumnType.classTypesAsJavaList().get(0).attributeDefinitions;
 			ImmutableSet<String> superTypes = hiveColumnType.classTypesAsJavaList().get(0).superTypes;
-			AttributeDefinition[] attributeDefinitions = Arrays.copyOf(attributes, attributes.length+3);
+			AttributeDefinition[] attributeDefinitions = Arrays.copyOf(attributes, attributes.length+4);
 			attributeDefinitions[attributes.length] = new AttributeDefinition("column_type", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null);
-			attributeDefinitions[attributes.length+1] = new AttributeDefinition("granularity", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null);
-			attributeDefinitions[attributes.length+2] = new AttributeDefinition("historian_tags", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_TAG.getName()), Multiplicity.OPTIONAL, false, null);
+			attributeDefinitions[attributes.length+1] = new AttributeDefinition("column_function", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null);
+			attributeDefinitions[attributes.length+2] = new AttributeDefinition("granularity", DataTypes.STRING_TYPE.getName(), Multiplicity.OPTIONAL, false, null);
+			attributeDefinitions[attributes.length+3] = new AttributeDefinition("historian_tags", DataTypes.arrayTypeName(HistorianDataTypes.HISTORIAN_TAG.getName()), Multiplicity.OPTIONAL, false, null);
 			
 			HierarchicalTypeDefinition<ClassType> updateClass = TypesUtil.createClassTypeDef(typeName, superTypes, attributeDefinitions);
 			getLogger().info("********** Updating " + typeName + " definition: " + TypesSerialization.toJson(updateClass,false));
