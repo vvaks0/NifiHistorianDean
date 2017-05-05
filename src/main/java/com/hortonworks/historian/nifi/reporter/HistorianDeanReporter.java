@@ -225,7 +225,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				}*/
 				String historianDataModelJSON = generateHistorianDataModel();
         		getLogger().info("***************** Historian Data Model as JSON = " + historianDataModelJSON);
-        		atlasClient.createType(historianDataModelJSON);
+        		//atlasClient.createType(historianDataModelJSON);
 				getLogger().info("********************* Created Types: " + atlasClient.createType(historianDataModelJSON));
 				
 				updateHiveColumnClassAttributes();
