@@ -26,11 +26,11 @@ import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
-import org.apache.nifi.distributed.cache.client.Deserializer;
+/*import org.apache.nifi.distributed.cache.client.Deserializer;
 import org.apache.nifi.distributed.cache.client.DistributedMapCacheClient;
 import org.apache.nifi.distributed.cache.client.Serializer;
 import org.apache.nifi.distributed.cache.client.exception.DeserializationException;
-import org.apache.nifi.distributed.cache.client.exception.SerializationException;
+import org.apache.nifi.distributed.cache.client.exception.SerializationException; */
 import org.apache.nifi.expression.AttributeExpression;
 import org.apache.nifi.expression.AttributeExpression.ResultType;
 import org.apache.nifi.flowfile.FlowFile;
@@ -69,7 +69,7 @@ import java.util.Set;
 @SeeAlso(classNames = {"org.apache.nifi.distributed.cache.client.DistributedMapCacheClientService", "org.apache.nifi.distributed.cache.server.map.DistributedMapCacheServer",
         "org.apache.nifi.processors.standard.PutDistributedMapCache"})
 public class BulkFetchDistributedMapCache extends AbstractProcessor {
-
+/*
     public static final PropertyDescriptor PROP_DISTRIBUTED_CACHE_SERVICE = new PropertyDescriptor.Builder()
             .name("Distributed Cache Service")
             .description("The Controller Service that is used to get the cached values.")
@@ -112,7 +112,7 @@ public class BulkFetchDistributedMapCache extends AbstractProcessor {
             .addValidator(StandardValidators.CHARACTER_SET_VALIDATOR)
             .defaultValue("UTF-8")
             .build();
-
+*/
     public static final Relationship REL_SUCCESS = new Relationship.Builder()
             .name("success")
             .description("If the cache was successfully communicated with it will be routed to this relationship")
@@ -127,8 +127,8 @@ public class BulkFetchDistributedMapCache extends AbstractProcessor {
             .build();
     private final Set<Relationship> relationships;
 
-    private final Serializer<String> keySerializer = new StringSerializer();
-    private final Deserializer<byte[]> valueDeserializer = new CacheValueDeserializer();
+    //private final Serializer<String> keySerializer = new StringSerializer();
+    //private final Deserializer<byte[]> valueDeserializer = new CacheValueDeserializer();
 
     public BulkFetchDistributedMapCache() {
         final Set<Relationship> rels = new HashSet<>();
@@ -141,11 +141,11 @@ public class BulkFetchDistributedMapCache extends AbstractProcessor {
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
         final List<PropertyDescriptor> descriptors = new ArrayList<>();
-        descriptors.add(PROP_CACHE_ENTRY_IDENTIFIER);
+        /*descriptors.add(PROP_CACHE_ENTRY_IDENTIFIER);
         descriptors.add(PROP_DISTRIBUTED_CACHE_SERVICE);
         descriptors.add(PROP_PUT_CACHE_VALUE_IN_ATTRIBUTE);
         descriptors.add(PROP_PUT_ATTRIBUTE_MAX_LENGTH);
-        descriptors.add(PROP_CHARACTER_SET);
+        descriptors.add(PROP_CHARACTER_SET);*/
         return descriptors;
     }
 
@@ -160,7 +160,8 @@ public class BulkFetchDistributedMapCache extends AbstractProcessor {
         if (flowFile == null) {
             return;
         }
-
+        session.transfer(flowFile, REL_SUCCESS);
+/*	
         final ComponentLog logger = getLogger();
         final String cacheKey = context.getProperty(PROP_CACHE_ENTRY_IDENTIFIER).evaluateAttributeExpressions(flowFile).getValue();
         if (StringUtils.isBlank(cacheKey)) {
@@ -221,9 +222,9 @@ public class BulkFetchDistributedMapCache extends AbstractProcessor {
             flowFile = session.penalize(flowFile);
             session.transfer(flowFile, REL_FAILURE);
             logger.error("Unable to communicate with cache when processing {} due to {}", new Object[]{flowFile, e});
-        }
+        }*/
     }
-
+/*
     public static class CacheValueDeserializer implements Deserializer<byte[]> {
 
         @Override
@@ -241,6 +242,6 @@ public class BulkFetchDistributedMapCache extends AbstractProcessor {
         public void serialize(final String value, final OutputStream out) throws SerializationException, IOException {
             out.write(value.getBytes(StandardCharsets.UTF_8));
         }
-    }
+    }*/
 
 }
