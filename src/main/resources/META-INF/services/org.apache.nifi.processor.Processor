@@ -1,1 +1,1 @@
-com.hortonworks.nifi.processors.BulkFetchDistributedMapCache;
+com.hortonworks.nifi.processors.BulkFetchDistributedMapCache
