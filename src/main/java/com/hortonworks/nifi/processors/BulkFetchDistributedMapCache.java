@@ -44,6 +44,8 @@ import org.apache.nifi.processor.io.OutputStreamCallback;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.codehaus.jackson.map.ObjectMapper;
 
+import scala.actors.threadpool.Arrays;
+
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
@@ -173,12 +175,14 @@ public class BulkFetchDistributedMapCache extends AbstractProcessor {
         try {
         	logger.info("********** CacheKey: " + cacheKey);
         	String[] keys = cacheKey.split(",");
-        	logger.info("********** KeysArray: " + keys);
+        	logger.info("********** KeysArray: " + Arrays.toString(keys));
         	List<Map<String,Object>> results = new ArrayList<Map<String,Object>>();
         	for(String key : keys){
+        		logger.info("********** In Loop for key: " + key);
         		if(cache.containsKey(key, keySerializer)){
         			Map<String,Object> currentResult = new HashMap<String,Object>();
-        			String currentResultJson = new String(cache.get(cacheKey, keySerializer, valueDeserializer),selectedEncoding);
+        			String currentResultJson = new String(cache.get(key, keySerializer, valueDeserializer),selectedEncoding);
+        			logger.info("********** In Loop Current Result: " + currentResultJson);
         			currentResult.put(key, new ObjectMapper().readValue(currentResultJson, HashMap.class));
         			results.add(currentResult);
         		}else{
