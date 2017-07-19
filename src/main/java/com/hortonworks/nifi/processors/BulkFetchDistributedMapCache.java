@@ -171,8 +171,10 @@ public class BulkFetchDistributedMapCache extends AbstractProcessor {
         final DistributedMapCacheClient cache = context.getProperty(PROP_DISTRIBUTED_CACHE_SERVICE).asControllerService(DistributedMapCacheClient.class);
         String selectedEncoding = context.getProperty(PROP_CHARACTER_SET).getValue();
         try {
+        	logger.info("********** CacheKey: " + cacheKey);
         	String[] keys = cacheKey.split(",");
-            List<Map<String,Object>> results = new ArrayList<Map<String,Object>>();
+        	logger.info("********** KeysArray: " + keys);
+        	List<Map<String,Object>> results = new ArrayList<Map<String,Object>>();
         	for(String key : keys){
         		if(cache.containsKey(key, keySerializer)){
         			Map<String,Object> currentResult = new HashMap<String,Object>();
@@ -183,7 +185,7 @@ public class BulkFetchDistributedMapCache extends AbstractProcessor {
         			logger.info("Could not find an entry in cache for {}; ", new Object[]{flowFile});
         		}
             }
-        	
+        	logger.info("********** KeyListMaps: " + results);
         	String jsonResult = new ObjectMapper().writeValueAsString(results);
             if(jsonResult.isEmpty()){
                 session.transfer(flowFile, REL_NOT_FOUND);
