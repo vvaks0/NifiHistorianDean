@@ -370,6 +370,19 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     	return granularity;
     }
 	
+	private JSONObject createBusinessTerm(String taxonomyPath, String termDefinition){
+		String atlasTaxonomyUrl = atlasUrl + "/api/atlas/v1/taxonomies" + taxonomyPath;
+		JSONObject json = null;
+		try {
+			json = postJSONToUrlAuth(atlasTaxonomyUrl, basicAuth, termDefinition);
+		} catch (IOException e) {
+			e.printStackTrace();
+		} catch (JSONException e) {
+			e.printStackTrace();
+		}
+		return json;
+	}
+	
 	private Map<String, Object> getDruidDataSourceDetails(String dataSource) {
     	String druidSegmentUrl = druidBrokerUrl + "/druid/v2";
     	DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
@@ -760,6 +773,37 @@ public class HistorianDeanReporter extends AbstractReportingTask {
             e.printStackTrace();
         }
         return jsonArray;
+    }
+	
+	private JSONObject postJSONToUrlAuth(String urlString, String[] basicAuth, String payload) throws IOException, JSONException {
+		String userPassString = basicAuth[0]+":"+basicAuth[1];
+		JSONObject json = null;
+		try {
+            URL url = new URL (urlString);
+            //Base64.encodeBase64String(userPassString.getBytes());
+
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("POST");
+            connection.setDoOutput(true);
+            connection.setRequestProperty  ("Authorization", "Basic " + encoding);
+            connection.setRequestProperty("Content-Type", "application/json");
+            
+            //System.out.println("To String: " + convertPOJOToJSON(historianEvent));
+            
+            OutputStream os = connection.getOutputStream();
+    		os.write(payload.getBytes());
+    		os.flush();
+            
+            if (connection.getResponseCode() != 200 || connection.getResponseCode() != 201) {
+    			throw new RuntimeException("Failed : HTTP error code : " + connection.getResponseCode());
+    		}
+            BufferedReader rd = new BufferedReader(new InputStreamReader(connection.getInputStream(), Charset.forName("UTF-8")));
+  	      	String jsonText = readAll(rd);
+  	      	json = new JSONObject(jsonText);
+        } catch(Exception e) {
+            e.printStackTrace();
+        }
+        return json;
     }
 	
 	private String readAll(Reader rd) throws IOException {
