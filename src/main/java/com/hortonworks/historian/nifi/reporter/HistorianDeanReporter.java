@@ -18,6 +18,7 @@
 package com.hortonworks.historian.nifi.reporter;
 
 import org.apache.atlas.AtlasClient;
+import org.apache.atlas.AtlasClient.EntityResult;
 import org.apache.atlas.AtlasException;
 import org.apache.atlas.AtlasServiceException;
 import org.apache.atlas.typesystem.Referenceable;
@@ -214,6 +215,11 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         		Class.forName("org.apache.hive.jdbc.HiveDriver");
         		hiveConnection = DriverManager.getConnection(hiveServerUri, hiveUsername, hivePassword);
 				
+        		getLogger().info("********************* Create Business Taxonomy Terms...");
+        		String termPath = "/Catalog/terms/Unassigned";
+        		String termDefinition = "{\"name\":\"Unassigned\",\"description\":\"\"}";
+        		createBusinessTerm(termPath, termDefinition);
+        		
 				getLogger().info("********************* Checking if data model has been created...");
 				/*
 				try {
@@ -286,7 +292,12 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				getLogger().info("********************* Updating Hive Column: " + columnName);
 				if(columnName.equalsIgnoreCase(TAG_DIMENSION_NAME) && granularity.equalsIgnoreCase("NONE")){	
 					getLogger().info("********************* This Column is a Tag_Dimension field, discovering Historian Tags...");
-					atlasClient.updateEntities(discoverNewTags(tableRef,columnRef));
+					EntityResult result = atlasClient.updateEntities(discoverNewTags(tableRef,columnRef));
+					Iterator<String> resultIterator = result.getCreatedEntities().iterator();
+					while(resultIterator.hasNext()){
+						String currentEntity = resultIterator.next();
+						postJSONToUrlAuth("/v1/entities/"+currentEntity+"/tags/Catalog.Unassigned" ,basicAuth,"{}");
+					}
 				}else{
 					atlasClient.updateEntities(columnRef);
 				}
