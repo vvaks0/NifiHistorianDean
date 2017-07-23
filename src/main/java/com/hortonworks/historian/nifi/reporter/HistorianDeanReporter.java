@@ -798,8 +798,9 @@ public class HistorianDeanReporter extends AbstractReportingTask {
             HttpURLConnection connection = (HttpURLConnection) url.openConnection();
             connection.setRequestMethod("POST");
             connection.setDoOutput(true);
-            connection.setRequestProperty  ("Authorization", "Basic " + encoding);
+            connection.setRequestProperty("Authorization", "Basic " + encoding);
             connection.setRequestProperty("Content-Type", "application/json");
+            connection.setRequestProperty("X-XSRF-HEADER","User");
             
             //System.out.println("To String: " + convertPOJOToJSON(historianEvent));
             
