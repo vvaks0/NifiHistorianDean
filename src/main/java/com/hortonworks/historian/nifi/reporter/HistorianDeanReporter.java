@@ -294,9 +294,11 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 					getLogger().info("********************* This Column is a Tag_Dimension field, discovering Historian Tags...");
 					EntityResult result = atlasClient.updateEntities(discoverNewTags(tableRef,columnRef));
 					Iterator<String> resultIterator = result.getCreatedEntities().iterator();
+					getLogger().info("********************* Adding Unassigned Term to Historian Tag GUIDs... "+result.getCreatedEntities().toString());
 					while(resultIterator.hasNext()){
 						String currentEntity = resultIterator.next();
-						postJSONToUrlAuth("/v1/entities/"+currentEntity+"/tags/Catalog.Unassigned" ,basicAuth,"{}");
+						getLogger().info("********************* Calling Atlas with URL: "+atlasUrl+"/api/atlas/v1/entities/"+currentEntity+"/tags/Catalog.Unassigned");
+						postJSONToUrlAuth("/api/atlas/v1/entities/"+currentEntity+"/tags/Catalog.Unassigned" ,basicAuth,"{}");
 					}
 				}else{
 					atlasClient.updateEntities(columnRef);
