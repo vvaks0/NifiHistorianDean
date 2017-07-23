@@ -298,7 +298,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 					while(resultIterator.hasNext()){
 						String currentEntity = resultIterator.next();
 						getLogger().info("********************* Calling Atlas with URL: "+atlasUrl+"/api/atlas/v1/entities/"+currentEntity+"/tags/Catalog.Unassigned");
-						postJSONToUrlAuth("/api/atlas/v1/entities/"+currentEntity+"/tags/Catalog.Unassigned" ,basicAuth,"{}");
+						postJSONToUrlAuth(atlasUrl+"/api/atlas/v1/entities/"+currentEntity+"/tags/Catalog.Unassigned" ,basicAuth,"{}");
 					}
 				}else{
 					atlasClient.updateEntities(columnRef);
