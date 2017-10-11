@@ -35,6 +35,14 @@ import org.apache.atlas.typesystem.types.Multiplicity;
 import org.apache.atlas.typesystem.types.StructTypeDefinition;
 import org.apache.atlas.typesystem.types.TraitType;
 import org.apache.atlas.typesystem.types.utils.TypesUtil;
+import org.apache.commons.io.IOUtils;
+import org.apache.directory.api.util.Base64;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.htrace.fasterxml.jackson.core.JsonParseException;
 import org.apache.htrace.fasterxml.jackson.databind.JsonMappingException;
 import org.apache.htrace.fasterxml.jackson.databind.ObjectMapper;
@@ -61,6 +69,8 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.Reader;
 import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.sql.Connection;
@@ -68,9 +78,12 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.text.DateFormat;
+import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -78,7 +91,7 @@ import java.util.List;
 import java.util.Map;
 
 @Tags({"reporting", "atlas", "historian", "orchestration"})
-@CapabilityDescription("Publishes Historian Tags from Druid to Apache Atlas, Exposes Druid Datasources as Hive Tables, Initiates Druid re-Indexing Jobs on Late Arriving Data.")
+@CapabilityDescription("Publishes Historian Tags from Druid to Apache Atlas, Exposes Druid Datasources as Hive Tables, Initiates Druid Indexing Jobs on Late Arriving Data.")
 public class HistorianDeanReporter extends AbstractReportingTask {
 
 	static final PropertyDescriptor HISTORIAN_TAG_DIMENSION = new PropertyDescriptor.Builder()
@@ -87,6 +100,16 @@ public class HistorianDeanReporter extends AbstractReportingTask {
             .required(true)
             .expressionLanguageSupported(true)
             .defaultValue("tag_dimension")
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+	static final PropertyDescriptor LATE_DATA_ROOT = new PropertyDescriptor.Builder()
+    		.name("Late data path")
+    		.description("The root location where late arriving data can be found. "
+    				+ "Will concatenate this path with query granularity of each Tranquiluty service detected. "
+    				+ "(/apps/historian/minute or /apps/historian/none)")
+            .required(true)
+            .expressionLanguageSupported(true)
+            .defaultValue("/apps/historian")
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 	static final PropertyDescriptor ATLAS_URL = new PropertyDescriptor.Builder()
@@ -105,6 +128,14 @@ public class HistorianDeanReporter extends AbstractReportingTask {
             .defaultValue("http://localhost:9090")
             .addValidator(StandardValidators.URL_VALIDATOR)
             .build();
+    static final PropertyDescriptor NAME_NODE_URL = new PropertyDescriptor.Builder()
+            .name("Name Node URL")
+            .description("The URL of the Name Node of the cluster where late arriving date lands")
+            .required(true)
+            .expressionLanguageSupported(true)
+            .defaultValue("hdfs://localhost:8020")
+            .addValidator(StandardValidators.URL_VALIDATOR)
+            .build();
     static final PropertyDescriptor HIVE_SERVER_CONNECTION_STRING = new PropertyDescriptor.Builder()
             .name("Hive Server Connection String")
             .description("The connection string for Hive Server that contains the database where Druid backed tables are managed.")
@@ -121,6 +152,14 @@ public class HistorianDeanReporter extends AbstractReportingTask {
             .defaultValue("http://localhost:8082")
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
+    static final PropertyDescriptor DRUID_OVERLORD_HTTP_ENDPOINT = new PropertyDescriptor.Builder()
+    		.name("Druid Overlord HTTP endpoint")
+    		.description("Druid Overlord HTTP endpoint")
+            .required(true)
+            .expressionLanguageSupported(true)
+            .defaultValue("http://localhost:8090")
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
     static final PropertyDescriptor DRUID_METASTORE_CONNECTION_STRING = new PropertyDescriptor.Builder()
     		.name("Druid Meta Store Connection String")
     		.description("The connection string for the Druid Metastore that contains information about Druid's storage segments.")
@@ -131,15 +170,21 @@ public class HistorianDeanReporter extends AbstractReportingTask {
             .build();
     
     private int timesTriggered = 0;
-    private AtlasClient atlasClient;
-    
     private Double atlasVersion = 0.0;
-    private String encoding = "YWRtaW46YWRtaW4=";
+    private AtlasClient atlasClient;
+
     private String DEFAULT_ADMIN_USER = "admin";
-    private String DEFAULT_ADMIN_PASS = "admin";
+    private String DEFAULT_ADMIN_PASS = "admin";    
+
+    private FileSystem fs;
+    
+    private String lateDataRoot;
+    private String lateDataTasksPath;
     private String atlasUrl;
     private String nifiUrl;
+    private String nameNodeUrl;
     private String druidBrokerUrl;
+    private String druidOverlordUrl;
     private String hiveServerUri;
     private String[] basicAuth = {DEFAULT_ADMIN_USER, DEFAULT_ADMIN_PASS};
     
@@ -152,6 +197,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     private String PROPERTIES = "parameters";
     private String TAG_DIMENSION_NAME = "tag_dimension";
     
+    private Map<String,Object> deltaIndexTasks = new HashMap<String,Object>();
     private Map<String,Map<String, Object>> dataSourceDetails = new HashMap<String,Map<String,Object>>();
     private Map<String, EnumTypeDefinition> enumTypeDefinitionMap = new HashMap<String, EnumTypeDefinition>();
 	private Map<String, StructTypeDefinition> structTypeDefinitionMap = new HashMap<String, StructTypeDefinition>();
@@ -165,10 +211,13 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
         final List<PropertyDescriptor> properties = new ArrayList<>();
         properties.add(HISTORIAN_TAG_DIMENSION);
+        properties.add(LATE_DATA_ROOT);
         properties.add(ATLAS_URL);
         properties.add(NIFI_URL);
+        properties.add(NAME_NODE_URL);
         properties.add(HIVE_SERVER_CONNECTION_STRING);
         properties.add(DRUID_BROKER_HTTP_ENDPOINT);
+        properties.add(DRUID_OVERLORD_HTTP_ENDPOINT);
         //properties.add(DRUID_METASTORE_CONNECTION_STRING);
         return properties;
     }
@@ -187,9 +236,13 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     	outputs = new ArrayList<Referenceable>();
         //EventAccess eventAccess = reportingContext.getEventAccess();
         //int pageSize = reportingContext.getProperty(ACTION_PAGE_SIZE).asInteger();
+    	lateDataRoot = reportingContext.getProperty(LATE_DATA_ROOT).getValue();
+    	lateDataTasksPath = lateDataRoot + "/tasks";
         atlasUrl = reportingContext.getProperty(ATLAS_URL).getValue();
         nifiUrl = reportingContext.getProperty(NIFI_URL).getValue();
+        nameNodeUrl = reportingContext.getProperty(NAME_NODE_URL).getValue();
         druidBrokerUrl = reportingContext.getProperty(DRUID_BROKER_HTTP_ENDPOINT).getValue();
+        druidOverlordUrl = reportingContext.getProperty(DRUID_OVERLORD_HTTP_ENDPOINT).getValue();
         hiveServerUri = reportingContext.getProperty(HIVE_SERVER_CONNECTION_STRING).getValue();
         TAG_DIMENSION_NAME = reportingContext.getProperty(HISTORIAN_TAG_DIMENSION).getValue();
         //druidMetaUri = reportingContext.getProperty(DRUID_METASTORE_CONNECTION_STRING).getValue();
@@ -202,25 +255,52 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     	
     	if(atlasVersion == 0.0){
         	atlasVersion = Double.valueOf(getAtlasVersion(atlasUrl + "/api/atlas/admin/version", basicAuth));
-        	getLogger().info("********************* Atlas Version is: " + atlasVersion);
+        	getLogger().info("********** Atlas Version is: " + atlasVersion);
     	}
     	
-    	getLogger().info("********************* Number of Reports Sent: " + timesTriggered);
+    	getLogger().info("********** Number of Reports Sent: " + timesTriggered);
         if(timesTriggered == 0){
         	String hiveUsername = "hive";
 		    String hivePassword = "hive";
 		    
         	try {
-        		getLogger().info("********************* Establishing Connection to Hive Server...");
+        		getLogger().info("********** Establishing Connection to HDFS...");
+        		String hdfsPath = nameNodeUrl + "/";
+				Configuration conf = new Configuration();
+				conf.set("fs.hdfs.impl", org.apache.hadoop.hdfs.DistributedFileSystem.class.getName());
+				conf.set("fs.file.impl", org.apache.hadoop.fs.LocalFileSystem.class.getName());
+				fs = FileSystem.get(new URI(hdfsPath), conf);
+				//createHDFSDirectory(lateDataRoot);
+				createHDFSDirectory(lateDataTasksPath);
+				
+				getLogger().info("********** Checking for Unresolved Indexing Tasks...");
+				FileStatus[] fileStatus = fs.listStatus(new Path(lateDataTasksPath));
+				for(FileStatus status : fileStatus){
+					if(status.isDirectory()){
+						String[] address = status.getPath().toString().split("/");
+						String currentPath = status.getPath().toString();
+						String currentDirName = address[address.length - 1];
+						String currentTaskId = currentDirName.replace("|", ":");
+						String ingestSpec = readHDFSFile(currentPath+"/ingestSpec");
+						List<String> sourceData = Arrays.asList(readHDFSFile(currentPath+"/sourceData").split(","));
+						getLogger().info("********** Loading Unresolved Indexing Task:" + currentTaskId);
+						Map<String,Object> currentTaskMetaData = new HashMap<String,Object>();
+						currentTaskMetaData.put("ingestSpec", ingestSpec);
+						currentTaskMetaData.put("sourceData", sourceData);
+						deltaIndexTasks.put(currentTaskId, currentTaskMetaData);
+					}
+				}
+				
+        		getLogger().info("********** Establishing Connection to Hive Server...");
         		Class.forName("org.apache.hive.jdbc.HiveDriver");
         		hiveConnection = DriverManager.getConnection(hiveServerUri, hiveUsername, hivePassword);
 				
-        		getLogger().info("********************* Create Business Taxonomy Terms...");
+        		getLogger().info("********** Create Business Taxonomy Terms...");
         		String termPath = "/Catalog/terms/Unassigned";
         		String termDefinition = "{\"name\":\"Unassigned\",\"description\":\"\"}";
         		createBusinessTerm(termPath, termDefinition);
         		
-				getLogger().info("********************* Checking if data model has been created...");
+				getLogger().info("********** Checking if data model has been created...");
 				/*
 				try {
 					atlasClient.getType(HistorianDataTypes.TAG_DIMENSION.getName());
@@ -230,9 +310,9 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 					atlasClient.createTraitType(HistorianDataTypes.TAG_DIMENSION.getName());
 				}*/
 				String historianDataModelJSON = generateHistorianDataModel();
-        		getLogger().info("***************** Historian Data Model as JSON = " + historianDataModelJSON);
+        		getLogger().info("********** Historian Data Model as JSON = " + historianDataModelJSON);
         		//atlasClient.createType(historianDataModelJSON);
-				getLogger().info("********************* Created Types: " + atlasClient.createType(historianDataModelJSON));
+				getLogger().info("********** Created Types: " + atlasClient.createType(historianDataModelJSON));
 				
 				updateHiveColumnClassAttributes();
 				
@@ -244,28 +324,66 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				e.printStackTrace();
 			} catch (SQLException e) {
 				e.printStackTrace();
+			} catch (IOException e) {
+				e.printStackTrace();
+			} catch (URISyntaxException e) {
+				e.printStackTrace();
 			}
         }
         timesTriggered++;
         
-        getLogger().info("********************* Looking for Druid Datasources to expose as Hive Tables or update with new information...");
+        getLogger().info("********** Looking for Druid Datasources to expose as Hive Tables or update with new information...");
         Iterator<String> resultIterator = getDruidDataSourceList().iterator();
 		while(resultIterator.hasNext()){
 			String dataSource = resultIterator.next();
 			dataSourceDetails.put(dataSource, getDruidDataSourceDetails(dataSource));
 			
-			getLogger().info("********************* Exposing Druid Data Source: " + dataSource);
+			getLogger().info("********** Exposing Druid Data Source: " + dataSource);
 			exposeDruidDataSourceAsHiveTable(dataSource);
 			
-			getLogger().info("********************* Update Atlas Hive Tables and Column for Druid Data Source: " + dataSource);
+			getLogger().info("********** Update Atlas Hive Tables and Column for Druid Data Source: " + dataSource);
 			updateDataSourceHiveColumnAttributes(dataSource);
 		}
-
-		getLogger().info("********************* Done...");
 		
+		getLogger().info("********** Checking for Late Arriving Data...");
+		List<String> dataSourceExclusions = new ArrayList<String>();
+		List<String> deletedTasks = new ArrayList<String>();
+		Map<String,Object> newTasks = new HashMap<String,Object>();
+		for(String taskId: deltaIndexTasks.keySet()){
+			String status = getIndexTaskStatus(taskId);
+			if(status.equalsIgnoreCase("SUCCESS")){				
+				getLogger().info("********** Indexing Task " + taskId + " completed successfully, removing source data and task meta data...");
+				List<String> sourceDataList = (List<String>) ((Map)deltaIndexTasks.get(taskId)).get("sourceData");
+				Iterator<String> currentSourceObjectIterator = sourceDataList.iterator();
+				while(currentSourceObjectIterator.hasNext()){
+					String currentSourceObject = currentSourceObjectIterator.next();
+					deleteHDFSObject(currentSourceObject);
+				}
+				deleteHDFSObject(lateDataTasksPath +"/" + taskId.replace(":", "__"));
+				deletedTasks.add(taskId);
+			}else if(status.equalsIgnoreCase("PENDING") || status.equalsIgnoreCase("RUNNING")){
+				getLogger().info("********** Indexing Task " + taskId + " is currently " + status + ", excluding source data from eligibility for new indexing tasks");
+				List<String> sourceDataList = (List<String>) ((Map)deltaIndexTasks.get(taskId)).get("sourceData");
+				dataSourceExclusions.addAll(sourceDataList);
+			}else{
+				getLogger().info("********** Indexing Task " + taskId + " is in " + status + " state, excluding source data from eligibility for new indexing tasks");
+				getLogger().info("********** Obtain task logs from Druid Overlord Console, address the problem, and then restart the task manually...");
+				List<String> sourceDataList = (List<String>) ((Map)deltaIndexTasks.get(taskId)).get("sourceData");
+				dataSourceExclusions.addAll(sourceDataList);
+				String ingestSpec = (String)((Map)deltaIndexTasks.get(taskId)).get("ingestSpec");
+				String newTaskId = createDruidIndexingTask(ingestSpec);
+				renameHDFSObject(lateDataTasksPath +"/" + taskId.replace(":", "__"), lateDataTasksPath +"/" + newTaskId.replace(":", "__"));
+				newTasks.put(newTaskId, ((Map)deltaIndexTasks.get(taskId)));
+				deletedTasks.add(taskId);
+			}
+		}
+		deltaIndexTasks.putAll(newTasks);
+		deltaIndexTasks.keySet().removeAll(deletedTasks);
+		indexLateData(dataSourceExclusions);
+		getLogger().info("********** Done...");		
     }
     
-    public void updateDataSourceHiveColumnAttributes(String dataSource){
+    private void updateDataSourceHiveColumnAttributes(String dataSource){
     	String dslQuery = "hive_table where name = '"+dataSource+"'";
 		
 		try {
@@ -278,7 +396,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 			List<Referenceable> columnRefs = (List<Referenceable>) tableRef.getValuesMap().get("columns");
 		
 			Iterator<Referenceable> columnsIterator = columnRefs.iterator();
-			getLogger().info("********************* Discovering Tags and Updating Hive Columns in Atlas: " + dataSource);
+			getLogger().info("********** Discovering Tags and Updating Hive Columns in Atlas: " + dataSource);
 			while(columnsIterator.hasNext()){
 				Referenceable columnRef = columnsIterator.next();
 				getLogger().debug("********** Column Referencebales: " + columnRef);
@@ -289,16 +407,16 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				columnRef.set("granularity", granularity);
 				columnRef.set("column_type", column_type);
 				columnRef.set("column_function", column_function);
-				getLogger().info("********************* Updating Hive Column: " + columnName);
+				getLogger().info("********** Updating Hive Column: " + columnName);
 				if(columnName.equalsIgnoreCase(TAG_DIMENSION_NAME) && granularity.equalsIgnoreCase("NONE")){	
-					getLogger().info("********************* This Column is a Tag_Dimension field, discovering Historian Tags...");
+					getLogger().info("********** This Column is a Tag_Dimension field, discovering Historian Tags...");
 					EntityResult result = atlasClient.updateEntities(discoverNewTags(tableRef,columnRef));
 					Iterator<String> resultIterator = result.getCreatedEntities().iterator();
-					getLogger().info("********************* Adding Unassigned Term to Historian Tag GUIDs... "+result.getCreatedEntities().toString());
+					getLogger().info("********** Adding Unassigned Term to Historian Tag GUIDs... "+result.getCreatedEntities().toString());
 					while(resultIterator.hasNext()){
 						String currentEntity = resultIterator.next();
-						getLogger().info("********************* Calling Atlas with URL: "+atlasUrl+"/api/atlas/v1/entities/"+currentEntity+"/tags/Catalog.Unassigned");
-						postJSONToUrlAuth(atlasUrl+"/api/atlas/v1/entities/"+currentEntity+"/tags/Catalog.Unassigned" ,basicAuth,"{}");
+						getLogger().info("********** Calling Atlas with URL: "+atlasUrl+"/api/atlas/v1/entities/"+currentEntity+"/tags/Catalog.Unassigned");
+						postJSONToUrl(atlasUrl+"/api/atlas/v1/entities/"+currentEntity+"/tags/Catalog.Unassigned" ,basicAuth,"{}");
 					}
 				}else{
 					atlasClient.updateEntities(columnRef);
@@ -318,7 +436,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		}
     }
     
-    public String deserializeDataSourceColumnType(String dataSource, String column){
+    private String deserializeDataSourceColumnType(String dataSource, String column){
 		Map<String,Object>dataSourceMap = dataSourceDetails.get(dataSource);
 		Map<String,Object>columnMap = (Map)dataSourceMap.get("columns");
 		Map<String,Object>aggregatorMap = (Map)dataSourceMap.get("aggregators");
@@ -354,7 +472,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     	return columnType;
     }
 	
-	public String deserializeDataSourceGranularity(String dataSource){
+	private String deserializeDataSourceGranularity(String dataSource){
     	Map<String,Object> granularityMap = dataSourceDetails.get(dataSource);
     	getLogger().debug("********** granularityMap: " + granularityMap);
     	String granularityType = ((HashMap)granularityMap.get("queryGranularity")).get("type").toString();
@@ -387,7 +505,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		String atlasTaxonomyUrl = atlasUrl + "/api/atlas/v1/taxonomies" + taxonomyPath;
 		JSONObject json = null;
 		try {
-			json = postJSONToUrlAuth(atlasTaxonomyUrl, basicAuth, termDefinition);
+			json = postJSONToUrl(atlasTaxonomyUrl, basicAuth, termDefinition);
 		} catch (IOException e) {
 			e.printStackTrace();
 		} catch (JSONException e) {
@@ -411,10 +529,10 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		List<Map<String,Object>> result = null;
 		JSONArray druidSegmentsJSON;
 		try {
-			getLogger().debug("************************ Url: " + druidSegmentUrl);
-			getLogger().debug("************************ Sending: " + payload);
-			druidSegmentsJSON = readJSONArrayFromUrlAuthPOST(druidSegmentUrl, basicAuth, payload);
-			getLogger().debug("************************ Response from Druid: " + druidSegmentsJSON);
+			getLogger().debug("********** Url: " + druidSegmentUrl);
+			getLogger().debug("********** Sending: " + payload);
+			druidSegmentsJSON = postJSONArrayToUrl(druidSegmentUrl, basicAuth, payload);
+			getLogger().debug("********** Response from Druid: " + druidSegmentsJSON);
 	    	result = new ObjectMapper().readValue(druidSegmentsJSON.toString(), List.class);
 		} catch (IOException e) {
 			e.printStackTrace();
@@ -426,14 +544,14 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     	return dataSourceDetailsMap; 
 	}
 
-	public List<String> getDruidDataSourceList(){
+	private List<String> getDruidDataSourceList(){
 		String druidDataSourceUrl = druidBrokerUrl + "/druid/v2/datasources";
 		List<String> result = null;
     	JSONArray druidDataSourceJSON;
 		try {
-			getLogger().info("********************* Getting List of Druid Datasources from API: " + druidDataSourceUrl);
-			druidDataSourceJSON = readJSONArrayFromUrlAuth(druidDataSourceUrl, basicAuth);
-			getLogger().debug("************************ Response from Druid: " + druidDataSourceJSON);
+			getLogger().info("********** Getting List of Druid Datasources from API: " + druidDataSourceUrl);
+			druidDataSourceJSON = getJSONArrayFromUrl(druidDataSourceUrl, basicAuth);
+			getLogger().debug("********** Response from Druid: " + druidDataSourceJSON);
 	    	result = new ObjectMapper().readValue(druidDataSourceJSON.toString(), List.class);
 		} catch (IOException e) {
 			e.printStackTrace();
@@ -443,8 +561,8 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     	
     	return result;
     }
-	
-	public List<Referenceable> discoverNewTags(Referenceable tableRef, Referenceable columnRef){
+
+	private List<Referenceable> discoverNewTags(Referenceable tableRef, Referenceable columnRef){
 		String sqlString = null;
 		List<Referenceable> tagReferenceableList = new ArrayList<Referenceable>();
 		List<Id> tagIdList = new ArrayList<Id>();
@@ -456,7 +574,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 									+ " FROM "+currTableName+" "
 									+ " GROUP BY `"+currColumnName+"`";
 				
-			getLogger().debug("********************* Executing Hive Query: " + sqlString);
+			getLogger().debug("********** Executing Hive Query: " + sqlString);
 			ResultSet result = hiveConnection.createStatement().executeQuery(sqlString);
 			while(result.next()){
 				String currGranularity = deserializeDataSourceGranularity(currTableName);
@@ -465,7 +583,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				currTagReferenceable.set("qualifiedName",currTableName+"."+currColumnName+"."+result.getString(currColumnName));
 				currTagReferenceable.set("parent_column", currColumnRefId);
 				currTagReferenceable.set("granularity", currGranularity);
-				getLogger().debug("********************* New Tag Entity: " + InstanceSerialization.toJson(currTagReferenceable,true));
+				getLogger().debug("********** New Tag Entity: " + InstanceSerialization.toJson(currTagReferenceable,true));
 				tagReferenceableList.add(currTagReferenceable);	
 				tagIdList.add(currTagReferenceable.getId());
 			}
@@ -477,7 +595,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		return tagReferenceableList;
 	}
 	
-	public List<Referenceable> discoverNewTags(JSONArray results){
+	private List<Referenceable> discoverNewTags(JSONArray results){
 		String sqlString = null;
 		List<HashMap> referenceablesJSON = null;
 		List<Referenceable> tagReferenceableList = new ArrayList<Referenceable>();
@@ -500,7 +618,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 									+ " FROM "+currTableName+" "
 									+ " GROUP BY `"+currColumnName+"`";
 				
-				System.out.println("********************* Executing Hive Query: " + sqlString);
+				System.out.println("********** Executing Hive Query: " + sqlString);
 				ResultSet result = hiveConnection.createStatement().executeQuery(sqlString);
 				while(result.next()){
 					String currGranularity = deserializeDataSourceGranularity(currTableName);
@@ -509,7 +627,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 					currTagReferenceable.set("qualifiedName",currTableName+"."+currColumnName+"."+result.getString(currColumnName));
 					currTagReferenceable.set("parent_column", currColumnRefId);
 					currTagReferenceable.set("granularity", currGranularity);
-					System.out.println("********************* New Tag Entity: " + InstanceSerialization.toJson(currTagReferenceable,true));
+					System.out.println("********** New Tag Entity: " + InstanceSerialization.toJson(currTagReferenceable,true));
 					tagReferenceableList.add(currTagReferenceable);	
 				}
 			}
@@ -527,12 +645,12 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		return tagReferenceableList;
 	}
     
-    public void exposeDruidDataSourceAsHiveTable(String dataSource){
+    private void exposeDruidDataSourceAsHiveTable(String dataSource){
 	    String hiveTableName = "";
 	    try {
 	    	hiveTableName = dataSource;
 	    	dataSourceDetails.put(hiveTableName, getDruidDataSourceDetails(hiveTableName));
-	    	getLogger().info("********************* Attempting to create Hive Table from Druid Data Source: " + hiveTableName);
+	    	getLogger().info("********** Attempting to create Hive Table from Druid Data Source: " + hiveTableName);
 	    	hiveConnection.createStatement().execute("CREATE EXTERNAL TABLE IF NOT EXISTS " + hiveTableName + " "
 		    				+ "STORED BY 'org.apache.hadoop.hive.druid.DruidStorageHandler' "
 		    				+ "TBLPROPERTIES (\"druid.datasource\" = \"" + hiveTableName + "\")");
@@ -543,36 +661,205 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         }
     }
     
-	private JSONArray readJSONArrayFromUrlAuthPOST(String urlString, String[] basicAuth, String payload) throws IOException, JSONException {
-		String userPassString = basicAuth[0]+":"+basicAuth[1];
-		JSONObject json = null;
-		JSONArray jsonArray = null;
+    private void indexLateData(List<String> dataSourceExclusions){
+    	String nifiControllersUrl = nifiUrl + "/nifi-api/flow/process-groups/root/controller-services";
+		
 		try {
-            URL url = new URL (urlString);
-            //Base64.encodeBase64String(userPassString.getBytes());
-            
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod("POST");
-            connection.setDoOutput(true);
-            connection.setRequestProperty("Authorization", "Basic " + encoding);
-            connection.setRequestProperty("Content-Type", "application/json");
-            
-            OutputStream os = connection.getOutputStream();
-    		os.write(payload.getBytes());
-    		os.flush();
-            
-            if (connection.getResponseCode() != 200) {
-    			throw new RuntimeException("Failed : HTTP error code : " + connection.getResponseCode() + " : " + connection.getResponseMessage());
-    		}
-            
-            InputStream content = (InputStream)connection.getInputStream();
-            BufferedReader rd = new BufferedReader(new InputStreamReader(content, Charset.forName("UTF-8")));
-  	      	String jsonText = readAll(rd);
-  	      	jsonArray = new JSONArray(jsonText);
-        } catch(Exception e) {
-            e.printStackTrace();
-        }
-        return jsonArray;
+			JSONArray controllers = getJSONFromUrl(nifiControllersUrl, basicAuth).getJSONArray("controllerServices");
+			getLogger().info("********** Getting List of Druid Tranquility Controllers...");
+			for(int i=0; i<controllers.length(); i++){
+				JSONObject currentController = controllers.getJSONObject(i).getJSONObject("component");
+				String currentControllerType = currentController.getString("type");
+				if(currentControllerType.equalsIgnoreCase("com.hortonworks.nifi.controller.DruidTranquilityController")){					
+					String lateDataPath = lateDataRoot+"/"+currentController.getJSONObject("properties").getString("query_granularity").toLowerCase()+"/";
+					getLogger().info("********** Checking for Late Arriving Data at HDFS Path: " + lateDataPath);
+					FileStatus[] fileStatus = fs.listStatus(new Path(lateDataPath));
+					List<Date> dates = new ArrayList<Date>();
+					List<String> sourceData = new ArrayList<String>();
+					for(FileStatus status : fileStatus){
+						String[] address = status.getPath().toString().split("/");
+						String currentBin = address[address.length - 1];
+						Date binDate = new SimpleDateFormat("yyyy-MM-dd-HH-mm").parse(currentBin);
+						sourceData.add(lateDataPath+currentBin);
+						dates.add(binDate);
+					}
+					((Collection<?>) sourceData).removeAll(dataSourceExclusions);
+					getLogger().info("********** Detected " + sourceData.size() + " bins of relevant late data, initiating Delta Indexing task...");
+					
+					if(fileStatus.length > 0 && sourceData.size() > 0){
+						String intervalStart = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").format(Collections.min(dates));
+						String intervalEnd = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").format(Collections.max(dates));
+						String bins = String.join(",", sourceData);
+						JSONArray dimensionsList = new JSONArray(Arrays.asList(currentController.getJSONObject("properties").getString("dimensions_list").split(",")));
+						String ingestSpec = "{"
+							+ "	  \"type\" : \"index_hadoop\","
+							+ "	  \"spec\" : {"
+							+ "		\"dataSchema\" : {"
+							+ "			\"dataSource\": \""+currentController.getJSONObject("properties").getString("data_source")+"\","
+							+ "			\"parser\" : {"
+							+ "				\"type\" : \"hadoopyString\","
+							+ "				\"parseSpec\" : {"
+							+ "					\"format\" : \"json\","
+							+ "					\"timestampSpec\" : {"
+							+ "						\"column\" : \""+currentController.getJSONObject("properties").getString("timestamp_field")+"\","
+							+ "						\"format\" : \"auto\""
+							+ "					},"
+							+ "					\"dimensionsSpec\" : {"
+							+ "						\"dimensions\": " + dimensionsList
+							+ "					}"
+							+ "				}"
+							+ "			},"
+							+ "			\"metricsSpec\" : "+ currentController.getJSONObject("properties").getString("aggregators_descriptor") +","
+							+ "			\"granularitySpec\" : {"
+							+ "				\"type\" : \"uniform\","
+							+ "				\"segmentGranularity\" : \""+currentController.getJSONObject("properties").getString("segment_granularity")+"\","
+							+ "				\"queryGranularity\" : \""+currentController.getJSONObject("properties").getString("query_granularity")+"\","
+							+ "				\"intervals\": [\""+intervalStart+"/"+intervalEnd+"\"]"
+							+ "			}"
+							+ "		},"
+							+ "		\"ioConfig\" : {"
+							+ "			\"type\" : \"hadoop\","
+							+ "			\"inputSpec\" : {"
+							+ "				\"type\" : \"multi\","
+							+ "				\"children\": ["
+							+ "					{"
+							+ "						\"type\" : \"dataSource\","
+							+ "						\"ingestionSpec\" : {"
+							+ "							\"dataSource\": \""+currentController.getJSONObject("properties").getString("data_source")+"\","
+							+ "							\"intervals\": [\""+intervalStart+"/"+intervalEnd+"\"]"
+							+ "						}"
+							+ "					},"
+							+ "					{"
+							+ "						\"type\" : \"static\","
+							+ "						\"paths\": \""+bins+"\""
+							+ "					}"
+							+ "				]"
+							+ "			}"
+							+ "		},"
+							+ "		\"tuningConfig\" : {"
+							+ "			\"type\": \"hadoop\""
+							+ "		}"
+							+ "	  }"
+							+ "}";
+						getLogger().info("********** Delta Ingestion Spec: " + ingestSpec);
+						String indexTaskId = createDruidIndexingTask(ingestSpec);
+						getLogger().info("********** Created Indexing Task " + indexTaskId);
+						Map<String,Object> currentTaskMetaData = new HashMap<String,Object>();
+						currentTaskMetaData.put("ingestSpec", ingestSpec);
+						currentTaskMetaData.put("sourceData", sourceData);
+						deltaIndexTasks.put(indexTaskId, currentTaskMetaData);
+						String currentTaskDirPath = lateDataTasksPath + "/" + indexTaskId.replace(":", "__"); 
+						getLogger().info("********** Persisting Record of Task: " + currentTaskDirPath);
+						currentTaskDirPath = createHDFSDirectory(currentTaskDirPath);
+						writeHDFSFile(currentTaskDirPath+"/ingestSpec", ingestSpec);
+						writeHDFSFile(currentTaskDirPath+"/sourceData", bins);
+					}else{
+						getLogger().info("********** " + lateDataPath + " does not contain any data...");
+					}
+				}
+			}
+		} catch (IOException e) {
+			e.printStackTrace();
+		} catch (ParseException e) {
+			e.printStackTrace();
+		} catch (JSONException e) {
+			e.printStackTrace();
+		}
+    }
+    
+    private String getIndexTaskStatus(String indexTaskId){
+		String druidIndexTaskUrl = druidOverlordUrl + "/druid/indexer/v1/task/" + indexTaskId + "/status";
+    	JSONObject druidIndexTaskStatusJSON;
+    	String status = null;
+		try {
+			getLogger().info("********** Getting Index Task Status from Druid Overlord: " + druidIndexTaskUrl);
+			druidIndexTaskStatusJSON = getJSONFromUrl(druidIndexTaskUrl, basicAuth);
+			getLogger().debug("********** Response from Druid: " + druidIndexTaskStatusJSON);
+			status = druidIndexTaskStatusJSON.getJSONObject("status").getString("status");
+		} catch (IOException e) {
+			e.printStackTrace();
+		} catch (JSONException e) {
+			e.printStackTrace();
+		}
+    	
+    	return status;
+    }
+    
+    private String createDruidIndexingTask(String ingestSpec){
+    	String druidOverlordAPIUrl = druidOverlordUrl+ "/druid/indexer/v1/task";
+    	String indexTaskId = null;
+		try {
+			indexTaskId = postJSONToUrl(druidOverlordAPIUrl, basicAuth, ingestSpec).getString("task");
+		} catch (JSONException e) {
+			e.printStackTrace();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		
+    	return indexTaskId;
+    }
+    
+    private String createHDFSDirectory(String path){
+        Path hdfsPath = new Path(path);
+        try {
+			fs.mkdirs(hdfsPath);
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+        
+        return path;
+    }
+    
+    private String renameHDFSObject(String oldPathString, String newPathString){
+    	Path oldPath = new Path(oldPathString);
+    	Path newPath = new Path(newPathString);
+    	try {
+			fs.rename(oldPath, newPath);
+		} catch (IllegalArgumentException e) {
+			e.printStackTrace();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+    	
+    	return newPathString.toString();
+    }
+    
+    private boolean deleteHDFSObject(String path){
+        Path hdfsPath = new Path(path);
+        boolean isSuccessful = false;
+        try {
+        	isSuccessful = fs.delete(hdfsPath, true);
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+        
+        return isSuccessful;
+    }
+    
+    private String readHDFSFile(String path){
+        Path hdfsReadPath = new Path(path);
+        FSDataInputStream inputStream;
+        String out = null;
+        try {
+			inputStream = fs.open(hdfsReadPath);
+			out = IOUtils.toString(inputStream, "UTF-8");
+	        inputStream.close();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+    	return out;
+    }
+    
+    private void writeHDFSFile(String path, String payload){
+    	FSDataOutputStream outputStream = null;
+    	try {
+        	Path hdfswritepath = new Path(path);
+            outputStream = fs.create(hdfswritepath);
+			outputStream.writeBytes(payload);
+			outputStream.close();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
     }
 	
 	private void updateHiveColumnClassAttributes() throws AtlasException {
@@ -601,28 +888,28 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 	public String generateHistorianDataModel() throws AtlasException {
     	TypesDef typesDef;
 		String historianDataModelJSON;
-		System.out.println("***************** generate data model method call...");
+		System.out.println("********** generate data model method call...");
     	try {
 			atlasClient.getType(HistorianDataTypes.HISTORIAN_ASSET.getName());
-			getLogger().info("********************* Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_ASSET.getName() + " is already present");
+			getLogger().info("********** Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_ASSET.getName() + " is already present");
 		} catch (AtlasServiceException e) {
-			System.out.println("***************** create asset class...");
+			System.out.println("********** create asset class...");
 			createAssetClass();
 		}
 		
 		try {
 			atlasClient.getType(HistorianDataTypes.HISTORIAN_TAG.getName());
-			getLogger().info("********************* Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_TAG.getName() + " is already present");
+			getLogger().info("********** Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_TAG.getName() + " is already present");
 		} catch (AtlasServiceException e) {
-			System.out.println("***************** create tag class...");
+			System.out.println("********** create tag class...");
 			createTagClass();
 		}
 		
 		try {
 			atlasClient.getType(HistorianDataTypes.HISTORIAN_TAG_ATTRIBUTE.getName());
-			getLogger().info("********************* Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_TAG.getName() + " is already present");
+			getLogger().info("********** Historian Atlas Type: " + HistorianDataTypes.HISTORIAN_TAG.getName() + " is already present");
 		} catch (AtlasServiceException e) {
-			System.out.println("***************** create tag attribute class...");
+			System.out.println("********** create tag attribute class...");
 			createTagAttributeClass();
 		}
 		
@@ -713,12 +1000,12 @@ public class HistorianDeanReporter extends AbstractReportingTask {
     }
 	
 	private String getAtlasVersion(String urlString, String[] basicAuth){
-		getLogger().info("************************ Getting Atlas Version from: " + urlString);
+		getLogger().info("********** Getting Atlas Version from: " + urlString);
 		JSONObject json = null;
 		String versionValue = null;
         try{
-        	json = readJSONFromUrlAuth(urlString, basicAuth);
-        	getLogger().info("************************ Response from Atlas: " + json);
+        	json = getJSONFromUrl(urlString, basicAuth);
+        	getLogger().info("********** Response from Atlas: " + json);
         	versionValue = json.getString("Version");
         } catch (Exception e) {
             e.printStackTrace();
@@ -729,13 +1016,13 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 	private HashMap<String, Object> getProcessorConfig(String processorId, String urlString, String[] basicAuth){
 		String processorResourceUri = "/nifi-api/processors/";
 		String nifiProcessorUrl = urlString+processorResourceUri+processorId;
-		System.out.println("************************ Getting Nifi Processor from: " + nifiProcessorUrl);
+		System.out.println("********** Getting Nifi Processor from: " + nifiProcessorUrl);
 		JSONObject json = null;
 		JSONObject nifiComponentJSON = null;
 		HashMap<String,Object> result = null;
         try{
-        	json = readJSONFromUrlAuth(nifiProcessorUrl, basicAuth);
-        	System.out.println("************************ Response from Nifi: " + json);
+        	json = getJSONFromUrl(nifiProcessorUrl, basicAuth);
+        	System.out.println("********** Response from Nifi: " + json);
         	nifiComponentJSON = json.getJSONObject("component").getJSONObject("config").getJSONObject("properties");
         	result = new ObjectMapper().readValue(nifiComponentJSON.toString(), HashMap.class);
         } catch (Exception e) {
@@ -745,17 +1032,15 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 		return result;
 	}
 	
-	private JSONObject readJSONFromUrlAuth(String urlString, String[] basicAuth) throws IOException, JSONException {
+	private JSONObject getJSONFromUrl(String urlString, String[] basicAuth) throws IOException, JSONException {
 		String userPassString = basicAuth[0]+":"+basicAuth[1];
 		JSONObject json = null;
 		try {
             URL url = new URL (urlString);
-            //Base64.encodeBase64String(userPassString.getBytes());
-
             HttpURLConnection connection = (HttpURLConnection) url.openConnection();
             connection.setRequestMethod("GET");
             connection.setDoOutput(true);
-            connection.setRequestProperty  ("Authorization", "Basic " + encoding);
+            connection.setRequestProperty("Authorization", "Basic " + new String(Base64.encode(userPassString.getBytes())));
             InputStream content = (InputStream)connection.getInputStream();
             BufferedReader rd = new BufferedReader(new InputStreamReader(content, Charset.forName("UTF-8")));
   	      	String jsonText = readAll(rd);
@@ -766,18 +1051,15 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         return json;
     }
 	
-	private JSONArray readJSONArrayFromUrlAuth(String urlString, String[] basicAuth) throws IOException, JSONException {
+	private JSONArray getJSONArrayFromUrl(String urlString, String[] basicAuth) throws IOException, JSONException {
 		String userPassString = basicAuth[0]+":"+basicAuth[1];
-		JSONObject json = null;
 		JSONArray jsonArray = null;
 		try {
             URL url = new URL (urlString);
-            //Base64.encodeBase64String(userPassString.getBytes());
-
             HttpURLConnection connection = (HttpURLConnection) url.openConnection();
             connection.setRequestMethod("GET");
             connection.setDoOutput(true);
-            connection.setRequestProperty  ("Authorization", "Basic " + encoding);
+            connection.setRequestProperty("Authorization", "Basic " + new String(Base64.encode(userPassString.getBytes())));
             InputStream content = (InputStream)connection.getInputStream();
             BufferedReader rd = new BufferedReader(new InputStreamReader(content, Charset.forName("UTF-8")));
   	      	String jsonText = readAll(rd);
@@ -788,27 +1070,22 @@ public class HistorianDeanReporter extends AbstractReportingTask {
         return jsonArray;
     }
 	
-	private JSONObject postJSONToUrlAuth(String urlString, String[] basicAuth, String payload) throws IOException, JSONException {
+	private JSONObject postJSONToUrl(String urlString, String[] basicAuth, String payload) throws IOException, JSONException {
 		String userPassString = basicAuth[0]+":"+basicAuth[1];
 		JSONObject json = null;
 		try {
             URL url = new URL (urlString);
-            //Base64.encodeBase64String(userPassString.getBytes());
-
             HttpURLConnection connection = (HttpURLConnection) url.openConnection();
             connection.setRequestMethod("POST");
             connection.setDoOutput(true);
-            connection.setRequestProperty("Authorization", "Basic " + encoding);
+            connection.setRequestProperty("Authorization", "Basic " + new String(Base64.encode(userPassString.getBytes())));
             connection.setRequestProperty("Content-Type", "application/json");
             connection.setRequestProperty("X-XSRF-HEADER","User");
-            
-            //System.out.println("To String: " + convertPOJOToJSON(historianEvent));
-            
             OutputStream os = connection.getOutputStream();
     		os.write(payload.getBytes());
     		os.flush();
             
-            if (connection.getResponseCode() != 200 || connection.getResponseCode() != 201) {
+            if (connection.getResponseCode() > 202) {
     			throw new RuntimeException("Failed : HTTP error code : " + connection.getResponseCode());
     		}
             BufferedReader rd = new BufferedReader(new InputStreamReader(connection.getInputStream(), Charset.forName("UTF-8")));
@@ -818,6 +1095,35 @@ public class HistorianDeanReporter extends AbstractReportingTask {
             e.printStackTrace();
         }
         return json;
+    }
+	
+	private JSONArray postJSONArrayToUrl(String urlString, String[] basicAuth, String payload) throws IOException, JSONException {
+		String userPassString = basicAuth[0]+":"+basicAuth[1];
+		JSONArray jsonArray = null;
+		try {
+            URL url = new URL (urlString);
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("POST");
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Authorization", "Basic " + new String(Base64.encode(userPassString.getBytes())));
+            connection.setRequestProperty("Content-Type", "application/json");
+            
+            OutputStream os = connection.getOutputStream();
+    		os.write(payload.getBytes());
+    		os.flush();
+            
+            if (connection.getResponseCode() > 202) {
+    			throw new RuntimeException("Failed : HTTP error code : " + connection.getResponseCode() + " : " + connection.getResponseMessage());
+    		}
+            
+            InputStream content = (InputStream)connection.getInputStream();
+            BufferedReader rd = new BufferedReader(new InputStreamReader(content, Charset.forName("UTF-8")));
+  	      	String jsonText = readAll(rd);
+  	      	jsonArray = new JSONArray(jsonText);
+        } catch(Exception e) {
+            e.printStackTrace();
+        }
+        return jsonArray;
     }
 	
 	private String readAll(Reader rd) throws IOException {
@@ -830,7 +1136,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 	}
 	
 	public void registerHistorianMetaData(){
-		System.out.println("***************** Creating Meta Data Entities...");
+		System.out.println("********** Creating Meta Data Entities...");
 		
 		Referenceable tag_rpm_a = new Referenceable("historian_tag");
 		tag_rpm_a.set(AtlasClient.NAME, "rpm_truck_a");
@@ -884,7 +1190,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				entityMap.put("tag_mpg_a_id", tag_mpg_a_id);
 				System.out.println(entityMap);
 			}else{
-				System.out.println("***************** tag_mpg_a already exists");
+				System.out.println("********** tag_mpg_a already exists");
 			}
 			System.out.println(entityMap);
 			response = atlasClient.createEntity(tag_rpm_a);
