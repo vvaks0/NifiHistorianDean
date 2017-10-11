@@ -134,7 +134,7 @@ public class HistorianDeanReporter extends AbstractReportingTask {
             .required(true)
             .expressionLanguageSupported(true)
             .defaultValue("hdfs://localhost:8020")
-            .addValidator(StandardValidators.URL_VALIDATOR)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
     static final PropertyDescriptor HIVE_SERVER_CONNECTION_STRING = new PropertyDescriptor.Builder()
             .name("Hive Server Connection String")
