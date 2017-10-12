@@ -673,25 +673,26 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 				if(currentControllerType.equalsIgnoreCase("com.hortonworks.nifi.controller.DruidTranquilityController")){					
 					String lateDataPath = lateDataRoot+"/"+currentController.getJSONObject("properties").getString("query_granularity").toLowerCase()+"/";
 					getLogger().info("********** Checking for Late Arriving Data at HDFS Path: " + lateDataPath);
-					FileStatus[] fileStatus = fs.listStatus(new Path(lateDataPath));
-					List<Date> dates = new ArrayList<Date>();
-					List<String> sourceData = new ArrayList<String>();
-					for(FileStatus status : fileStatus){
-						String[] address = status.getPath().toString().split("/");
-						String currentBin = address[address.length - 1];
-						Date binDate = new SimpleDateFormat("yyyy-MM-dd-HH-mm").parse(currentBin);
-						sourceData.add(lateDataPath+currentBin);
-						dates.add(binDate);
-					}
-					((Collection<?>) sourceData).removeAll(dataSourceExclusions);
-					getLogger().info("********** Detected " + sourceData.size() + " bins of relevant late data, initiating Delta Indexing task...");
+					if(fs.exists(new Path(lateDataPath))){
+						FileStatus[] fileStatus = fs.listStatus(new Path(lateDataPath));
+						List<Date> dates = new ArrayList<Date>();
+						List<String> sourceData = new ArrayList<String>();
+						for(FileStatus status : fileStatus){
+							String[] address = status.getPath().toString().split("/");
+							String currentBin = address[address.length - 1];
+							Date binDate = new SimpleDateFormat("yyyy-MM-dd-HH-mm").parse(currentBin);
+							sourceData.add(lateDataPath+currentBin);
+							dates.add(binDate);
+						}
+						((Collection<?>) sourceData).removeAll(dataSourceExclusions);
+						getLogger().info("********** Detected " + sourceData.size() + " bins of relevant late data, initiating Delta Indexing task...");
 					
-					if(fileStatus.length > 0 && sourceData.size() > 0){
-						String intervalStart = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").format(Collections.min(dates));
-						String intervalEnd = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").format(Collections.max(dates));
-						String bins = String.join(",", sourceData);
-						JSONArray dimensionsList = new JSONArray(Arrays.asList(currentController.getJSONObject("properties").getString("dimensions_list").split(",")));
-						String ingestSpec = "{"
+						if(fileStatus.length > 0 && sourceData.size() > 0){
+							String intervalStart = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").format(Collections.min(dates));
+							String intervalEnd = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").format(Collections.max(dates));
+							String bins = String.join(",", sourceData);
+							JSONArray dimensionsList = new JSONArray(Arrays.asList(currentController.getJSONObject("properties").getString("dimensions_list").split(",")));
+							String ingestSpec = "{"
 							+ "	  \"type\" : \"index_hadoop\","
 							+ "	  \"spec\" : {"
 							+ "		\"dataSchema\" : {"
@@ -741,20 +742,23 @@ public class HistorianDeanReporter extends AbstractReportingTask {
 							+ "		}"
 							+ "	  }"
 							+ "}";
-						getLogger().info("********** Delta Ingestion Spec: " + ingestSpec);
-						String indexTaskId = createDruidIndexingTask(ingestSpec);
-						getLogger().info("********** Created Indexing Task " + indexTaskId);
-						Map<String,Object> currentTaskMetaData = new HashMap<String,Object>();
-						currentTaskMetaData.put("ingestSpec", ingestSpec);
-						currentTaskMetaData.put("sourceData", sourceData);
-						deltaIndexTasks.put(indexTaskId, currentTaskMetaData);
-						String currentTaskDirPath = lateDataTasksPath + "/" + indexTaskId.replace(":", "__"); 
-						getLogger().info("********** Persisting Record of Task: " + currentTaskDirPath);
-						currentTaskDirPath = createHDFSDirectory(currentTaskDirPath);
-						writeHDFSFile(currentTaskDirPath+"/ingestSpec", ingestSpec);
-						writeHDFSFile(currentTaskDirPath+"/sourceData", bins);
+							getLogger().info("********** Delta Ingestion Spec: " + ingestSpec);
+							String indexTaskId = createDruidIndexingTask(ingestSpec);
+							getLogger().info("********** Created Indexing Task " + indexTaskId);
+							Map<String,Object> currentTaskMetaData = new HashMap<String,Object>();
+							currentTaskMetaData.put("ingestSpec", ingestSpec);
+							currentTaskMetaData.put("sourceData", sourceData);
+							deltaIndexTasks.put(indexTaskId, currentTaskMetaData);
+							String currentTaskDirPath = lateDataTasksPath + "/" + indexTaskId.replace(":", "__"); 
+							getLogger().info("********** Persisting Record of Task: " + currentTaskDirPath);
+							currentTaskDirPath = createHDFSDirectory(currentTaskDirPath);
+							writeHDFSFile(currentTaskDirPath+"/ingestSpec", ingestSpec);
+							writeHDFSFile(currentTaskDirPath+"/sourceData", bins);
+						}else{
+							getLogger().info("********** " + lateDataPath + " does not contain any data...");
+						}
 					}else{
-						getLogger().info("********** " + lateDataPath + " does not contain any data...");
+						getLogger().info("********** There is a Druid Controller mapped to " + lateDataPath + ", however, the path does not yet exist...");
 					}
 				}
 			}
